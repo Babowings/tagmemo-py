@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TagMemo Admin Console</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: Inter, "Segoe UI", system-ui, sans-serif; background: #0f1115; color: #e8e8e8; }
+    .layout { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+    .sidebar { border-right: 1px solid #222834; padding: 16px; background: #121621; }
+    .sidebar h1 { font-size: 16px; margin: 0 0 14px; }
+    .nav-btn { width: 100%; border: 1px solid #2f3747; background: #161d2b; color: #dfe8ff; border-radius: 8px; padding: 10px; text-align: left; margin-bottom: 8px; cursor: pointer; }
+    .nav-btn.active { border-color: #4b88ff; background: #1b2845; }
+    .main { padding: 18px; overflow: auto; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit,minmax(170px,1fr)); gap: 12px; margin-bottom: 16px; }
+    .card { border: 1px solid #2a3140; border-radius: 10px; padding: 12px; background: #131927; }
+    .card .k { font-size: 12px; color: #9ea7be; }
+    .card .v { margin-top: 8px; font-size: 20px; font-weight: 600; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    input, select, textarea, button { border: 1px solid #2f3747; background: #111723; color: #e8e8e8; border-radius: 8px; padding: 8px 10px; }
+    textarea { width: 100%; min-height: 120px; }
+    button { cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+    th, td { border-bottom: 1px solid #252d3b; padding: 8px; text-align: left; font-size: 12px; vertical-align: top; }
+    th { color: #9ea7be; }
+    pre { background: #0b0f17; border: 1px solid #2b3342; border-radius: 8px; padding: 10px; overflow: auto; white-space: pre-wrap; }
+    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .muted { color: #8f9ab2; font-size: 12px; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <h1>TagMemo 管理后台</h1>
+    <button class="nav-btn active" data-panel="overview">总览</button>
+    <button class="nav-btn" data-panel="query-logs">查询日志</button>
+    <button class="nav-btn" data-panel="db-explorer">数据库浏览</button>
+    <button class="nav-btn" data-panel="diaries">日记可视化</button>
+    <button class="nav-btn" data-panel="memory">记忆预览</button>
+  </aside>
+
+  <main class="main">
+    <section class="panel active" id="overview">
+      <div class="cards" id="overviewCards"></div>
+      <div class="muted">数据源：knowledge_base.sqlite + observability.sqlite + audit-*.jsonl</div>
+    </section>
+
+    <section class="panel" id="query-logs">
+      <div class="row">
+        <input id="logLimit" type="number" min="1" max="1000" value="100" />
+        <select id="logEndpoint">
+          <option value="">全部端点</option>
+          <option value="/v1/memory/query">/v1/memory/query</option>
+          <option value="/v1/chat/completions">/v1/chat/completions</option>
+          <option value="/v1/memory/delete">/v1/memory/delete</option>
+        </select>
+        <select id="logStatus">
+          <option value="">全部状态</option>
+          <option value="ok">ok</option>
+          <option value="error">error</option>
+        </select>
+        <button id="refreshLogs">刷新</button>
+      </div>
+      <table>
+        <thead>
+        <tr><th>时间</th><th>端点</th><th>消息</th><th>日记</th><th>结果数</th><th>耗时(ms)</th><th>状态</th></tr>
+        </thead>
+        <tbody id="logsBody"></tbody>
+      </table>
+      <h3>日志详情（按请求拆分）</h3>
+      <div id="logDetailsPanel" class="hidden">
+      <div class="split">
+        <div>
+          <div class="muted">基础信息</div>
+          <pre id="logSummary"></pre>
+        </div>
+        <div>
+          <div class="muted">metrics</div>
+          <pre id="logMetrics"></pre>
+        </div>
+      </div>
+      <div class="split">
+        <div>
+          <div class="muted">results</div>
+          <pre id="logResults"></pre>
+        </div>
+        <div>
+          <div class="muted">memory_context</div>
+          <pre id="logMemoryContext"></pre>
+        </div>
+      </div>
+      <div class="muted">原始事件</div>
+      <pre id="logRaw"></pre>
+      </div>
+      <div id="logDetailsHint" class="muted">点击上方某行后显示详细拆分信息。</div>
+    </section>
+
+    <section class="panel" id="db-explorer">
+      <div class="row">
+        <select id="dbSource"><option value="kb">knowledge_base</option><option value="audit">observability</option></select>
+        <select id="dbTable"></select>
+        <input id="dbSearch" placeholder="全文搜索（字符串匹配）" />
+        <input id="dbPage" type="number" min="1" value="1" />
+        <input id="dbPageSize" type="number" min="1" max="200" value="50" />
+        <button id="loadTable">加载</button>
+      </div>
+      <div id="dbMeta" class="muted"></div>
+      <div id="dbTableWrap"></div>
+    </section>
+
+    <section class="panel" id="diaries">
+      <div class="split">
+        <div>
+          <div class="row"><button id="refreshDiaries">刷新日记列表</button></div>
+          <table>
+            <thead><tr><th>Diary</th><th>文件数</th><th>最近更新</th></tr></thead>
+            <tbody id="diaryBody"></tbody>
+          </table>
+        </div>
+        <div>
+          <div class="row">
+            <select id="diaryFileSelect"></select>
+            <button id="loadDiaryFile">查看文件</button>
+          </div>
+          <pre id="diaryContent">选择某个日记本并加载文件内容</pre>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel" id="memory">
+      <div class="row">
+        <input id="memoryDiary" placeholder="diaryName（可选）" />
+        <span class="muted">重排序自动启用（由后端配置决定）</span>
+      </div>
+      <textarea id="memoryMessage" placeholder="输入查询内容"></textarea>
+      <div class="row"><button id="runMemoryPreview">执行记忆预览</button></div>
+      <div class="split">
+        <pre id="memoryMetrics">metrics</pre>
+        <pre id="memoryContext">memory_context</pre>
+      </div>
+      <h3>results</h3>
+      <pre id="memoryResults">[]</pre>
+    </section>
+  </main>
+</div>
+<script src="/admin/static/app.js"></script>
+</body>
+</html>

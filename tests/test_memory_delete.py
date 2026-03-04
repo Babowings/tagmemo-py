@@ -123,3 +123,36 @@ def test_delete_memory_by_diary_removes_all_files(tmp_path: Path):
 
     file_count = kb.db.execute("SELECT COUNT(*) FROM files WHERE diary_name='DiaryA'").fetchone()[0]
     assert file_count == 0
+
+
+def test_reconcile_missing_files_removes_stale_db_records(tmp_path: Path):
+    kb = _build_kb(tmp_path)
+    assert kb.db is not None
+
+    diary_idx = _DummyIndex()
+    kb.diary_indices["DiaryA"] = diary_idx
+
+    real_file = tmp_path / "data" / "dailynote" / "DiaryA" / "2026-01-01.md"
+    real_file.parent.mkdir(parents=True, exist_ok=True)
+    real_file.write_text("hello", encoding="utf-8")
+
+    kb.db.execute(
+        "INSERT INTO files (id, path, diary_name, checksum, mtime, size, updated_at) VALUES (1, ?, 'DiaryA', 'c1', 1, 1, 1)",
+        ("DiaryA/2026-01-01.md",),
+    )
+    kb.db.execute(
+        "INSERT INTO files (id, path, diary_name, checksum, mtime, size, updated_at) VALUES (2, ?, 'DiaryA', 'c2', 1, 1, 1)",
+        ("DiaryA/missing.md",),
+    )
+    kb.db.execute("INSERT INTO chunks (id, file_id, content, chunk_index, vector) VALUES (101, 1, 'keep', 0, ?)", (b"v",))
+    kb.db.execute("INSERT INTO chunks (id, file_id, content, chunk_index, vector) VALUES (102, 2, 'gone', 0, ?)", (b"v",))
+    kb.db.commit()
+
+    result = kb.reconcile_missing_files(dry_run=False)
+
+    assert result["missing_files"] == 1
+    assert result["deleted_files"] == 1
+
+    remaining = kb.db.execute("SELECT path FROM files ORDER BY id").fetchall()
+    assert remaining == [("DiaryA/2026-01-01.md",)]
+    assert diary_idx.removed == [102]

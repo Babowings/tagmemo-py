@@ -137,6 +137,13 @@ class KnowledgeBaseManager:
             self.tag_index = VectorIndex(dim, tag_capacity)
             self._recover_tags(db_path)
 
+        reconcile_result = self.reconcile_missing_files(dry_run=False)
+        if reconcile_result.get("missing_files", 0) > 0:
+            logger.warning(
+                "[KnowledgeBase] Reconciled %d missing files from DB on startup.",
+                reconcile_result.get("missing_files", 0),
+            )
+
         self._hydrate_diary_name_cache()
         self._build_cooccurrence_matrix()
 
@@ -983,6 +990,50 @@ class KnowledgeBaseManager:
             except ValueError:
                 return normalized_input.lstrip("/")
         return normalized_input.lstrip("/")
+
+    def reconcile_missing_files(self, dry_run: bool = False) -> dict:
+        if self.db is None:
+            return {
+                "dry_run": dry_run,
+                "missing_files": 0,
+                "target_files": [],
+                "deleted_files": 0,
+            }
+
+        rows = self.db.execute("SELECT path FROM files").fetchall()
+        root = Path(self.config["root_path"]).resolve()
+        missing_paths: list[str] = []
+
+        for row in rows:
+            rel = str(row[0]).replace("\\", "/")
+            target = (root / rel).resolve()
+            if not target.exists() or target.is_dir() or root not in target.parents:
+                missing_paths.append(rel)
+
+        missing_paths = list(dict.fromkeys(missing_paths))
+        if not missing_paths:
+            return {
+                "dry_run": dry_run,
+                "missing_files": 0,
+                "target_files": [],
+                "deleted_files": 0,
+            }
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "missing_files": len(missing_paths),
+                "target_files": missing_paths,
+                "deleted_files": 0,
+            }
+
+        deletion = self.delete_memories(file_paths=missing_paths, dry_run=False, cleanup_orphans=True)
+        return {
+            "dry_run": False,
+            "missing_files": len(missing_paths),
+            "target_files": missing_paths,
+            "deleted_files": int(deletion.get("deleted_files", 0)),
+        }
 
     def delete_memories(
         self,

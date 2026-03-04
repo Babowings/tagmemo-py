@@ -19,10 +19,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import uuid
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
+import sqlite3
 import sys
 import time
 from contextlib import asynccontextmanager
@@ -33,8 +36,10 @@ import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
+from tagmemo.audit_logger import AuditLogger
 from tagmemo.engine import TagMemoEngine
 
 # --------------- 环境变量 ---------------
@@ -61,9 +66,13 @@ logger = logging.getLogger("tagmemo.app")
 
 LOG_DIR = Path(__file__).resolve().parent / "log"
 LOG_DIR.mkdir(exist_ok=True)
+BASE_DIR = Path(__file__).resolve().parent
+WEB_ADMIN_DIR = BASE_DIR / "web" / "admin"
+KB_DB_PATH = BASE_DIR / "VectorStore" / "knowledge_base.sqlite"
 
 # --------------- Engine (全局单例) ---------------
 engine = TagMemoEngine()
+audit_logger = AuditLogger(LOG_DIR)
 
 
 # =================================================================
@@ -73,6 +82,7 @@ engine = TagMemoEngine()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时初始化引擎，关闭时优雅 shutdown。"""
+    audit_logger.initialize()
     await engine.initialize()
     logger.info("TagMemo Server ready on http://localhost:%d", PORT)
     yield
@@ -80,6 +90,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="TagMemo", lifespan=lifespan)
+
+if WEB_ADMIN_DIR.exists():
+    app.mount("/admin/static", StaticFiles(directory=str(WEB_ADMIN_DIR)), name="admin-static")
 
 # CORS（对应 app.use(cors())）
 app.add_middleware(
@@ -139,9 +152,22 @@ async def params_reload():
         return JSONResponse(status_code=500, content={"error": {"message": str(exc)}})
 
 
+@app.get("/admin")
+async def admin_dashboard():
+    if not WEB_ADMIN_DIR.exists():
+        return JSONResponse(status_code=404, content={"error": {"message": "Admin UI not found"}})
+    index_path = WEB_ADMIN_DIR / "index.html"
+    if not index_path.exists():
+        return JSONResponse(status_code=404, content={"error": {"message": "Admin index missing"}})
+    return FileResponse(index_path)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI 兼容的 Chat Completions 端点。"""
+    request_id = str(uuid.uuid4())
+    start_ts = time.perf_counter()
+
     try:
         body = await request.json()
     except Exception:
@@ -181,9 +207,44 @@ async def chat_completions(request: Request):
 
     # TagMemo 记忆检索
     logger.info('[App] Query: "%s..."', user_message[:80])
-    result = await engine.query(user_message, conversation_history)
+    try:
+        result = await engine.query(user_message, conversation_history)
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - start_ts) * 1000
+        await asyncio.to_thread(
+            _audit_query_event,
+            endpoint="/v1/chat/completions",
+            request_id=request_id,
+            message=user_message,
+            diary_name=None,
+            history=conversation_history,
+            use_rerank=False,
+            response_payload={"memory_context": "", "metrics": {}, "results": []},
+            duration_ms=duration_ms,
+            request=request,
+            status="error",
+            error=str(exc),
+        )
+        return JSONResponse(status_code=500, content={"error": {"message": str(exc)}})
+
     memory_context: str = result["memory_context"]
     metrics: dict = result["metrics"]
+
+    duration_ms = (time.perf_counter() - start_ts) * 1000
+    await asyncio.to_thread(
+        _audit_query_event,
+        endpoint="/v1/chat/completions",
+        request_id=request_id,
+        message=user_message,
+        diary_name=None,
+        history=conversation_history,
+        use_rerank=False,
+        response_payload=result,
+        duration_ms=duration_ms,
+        request=request,
+        status="ok",
+        error=None,
+    )
 
     # 构建增强消息数组
     enhanced_messages = _build_enhanced_messages(messages, memory_context)
@@ -233,6 +294,9 @@ async def chat_completions(request: Request):
 @app.post("/v1/memory/query")
 async def memory_query(request: Request):
     """直接查询 TagMemo 记忆（不调用 LLM）。"""
+    request_id = str(uuid.uuid4())
+    start_ts = time.perf_counter()
+
     try:
         body = await request.json()
     except Exception:
@@ -248,23 +312,60 @@ async def memory_query(request: Request):
             content={"error": {"message": "message is required"}},
         )
 
-    result = await engine.query(
-        message,
-        body.get("history") or [],
-        {
-            "diary_name": body.get("diaryName"),
-            "use_rerank": body.get("useRerank", False),
-        },
-    )
-    response_payload = result
+    history = body.get("history") or []
+    diary_name = body.get("diaryName")
+    use_rerank = bool(body.get("useRerank", False))
 
-    await _persist_memory_query_log(body, response_payload)
-    return response_payload
+    try:
+        result = await engine.query(
+            message,
+            history,
+            {
+                "diary_name": diary_name,
+                "use_rerank": use_rerank,
+            },
+        )
+        duration_ms = (time.perf_counter() - start_ts) * 1000
+        await asyncio.to_thread(
+            _audit_query_event,
+            endpoint="/v1/memory/query",
+            request_id=request_id,
+            message=message,
+            diary_name=diary_name,
+            history=history,
+            use_rerank=use_rerank,
+            response_payload=result,
+            duration_ms=duration_ms,
+            request=request,
+            status="ok",
+            error=None,
+        )
+        return result
+    except Exception as exc:
+        duration_ms = (time.perf_counter() - start_ts) * 1000
+        await asyncio.to_thread(
+            _audit_query_event,
+            endpoint="/v1/memory/query",
+            request_id=request_id,
+            message=message,
+            diary_name=diary_name,
+            history=history,
+            use_rerank=use_rerank,
+            response_payload={"memory_context": "", "metrics": {}, "results": []},
+            duration_ms=duration_ms,
+            request=request,
+            status="error",
+            error=str(exc),
+        )
+        return JSONResponse(status_code=500, content={"error": {"message": str(exc)}})
 
 
 @app.post("/v1/memory/delete")
 async def memory_delete(request: Request):
     """删除记忆数据（按路径或 diaryName）。"""
+    request_id = str(uuid.uuid4())
+    start_ts = time.perf_counter()
+
     try:
         body = await request.json()
     except Exception:
@@ -305,47 +406,322 @@ async def memory_delete(request: Request):
             dry_run=dry_run,
             cleanup_orphans=cleanup_orphans,
         )
-        return {
+        payload = {
             "status": "ok",
             "mode": "dry-run" if dry_run else "delete",
             **result,
         }
+        duration_ms = (time.perf_counter() - start_ts) * 1000
+        metrics = {
+            "result_count": int(payload.get("deleted_files", 0)),
+            "deleted_chunks": int(payload.get("deleted_chunks", 0)),
+            "deleted_tags": int(payload.get("deleted_tags", 0)),
+        }
+        await asyncio.to_thread(
+            _audit_query_event,
+            endpoint="/v1/memory/delete",
+            request_id=request_id,
+            message="",
+            diary_name=diary_name,
+            history=[],
+            use_rerank=False,
+            response_payload={
+                "memory_context": "",
+                "metrics": metrics,
+                "results": payload.get("target_files", []),
+            },
+            duration_ms=duration_ms,
+            request=request,
+            status="ok",
+            error=None,
+        )
+        return payload
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": {"message": str(exc)}})
     except Exception as exc:
+        duration_ms = (time.perf_counter() - start_ts) * 1000
+        await asyncio.to_thread(
+            _audit_query_event,
+            endpoint="/v1/memory/delete",
+            request_id=request_id,
+            message="",
+            diary_name=diary_name,
+            history=[],
+            use_rerank=False,
+            response_payload={"memory_context": "", "metrics": {}, "results": []},
+            duration_ms=duration_ms,
+            request=request,
+            status="error",
+            error=str(exc),
+        )
         return JSONResponse(status_code=500, content={"error": {"message": str(exc)}})
 
 
-def _append_jsonl(file_path: Path, payload: dict) -> None:
-    with file_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-async def _persist_memory_query_log(request_body: dict, response_body: dict) -> None:
-    """将 /v1/memory/query 请求与返回持久化到本地 JSONL 日志。"""
-    ts = time.time()
-    date_str = time.strftime("%Y%m%d", time.localtime(ts))
-    log_file = LOG_DIR / f"memory-query-{date_str}.jsonl"
-
-    log_record = {
-        "request_id": str(uuid.uuid4()),
-        "timestamp": ts,
-        "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts)),
-        "endpoint": "/v1/memory/query",
-        "request": {
-            "message": request_body.get("message"),
-            "history": request_body.get("history") or [],
-            "diaryName": request_body.get("diaryName"),
-            "useRerank": request_body.get("useRerank", False),
+@app.get("/v1/admin/overview")
+async def admin_overview():
+    kb_exists = KB_DB_PATH.exists()
+    overview = {
+        "knowledge_db": {
+            "exists": kb_exists,
+            "path": str(KB_DB_PATH),
+            "files": 0,
+            "chunks": 0,
+            "tags": 0,
+            "file_tags": 0,
+            "diaries": 0,
         },
-        "response": {
-            "memory_context": response_body.get("memory_context", ""),
-            "metrics": response_body.get("metrics", {}),
-            "results": response_body.get("results", []),
+        "observability": {
+            "path": str(audit_logger.db_path),
+            "events": 0,
+            "jsonl_files": len(audit_logger.list_jsonl_files()),
         },
     }
 
-    await asyncio.to_thread(_append_jsonl, log_file, log_record)
+    if kb_exists:
+        conn = sqlite3.connect(KB_DB_PATH)
+        overview["knowledge_db"]["files"] = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        overview["knowledge_db"]["chunks"] = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        overview["knowledge_db"]["tags"] = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
+        overview["knowledge_db"]["file_tags"] = conn.execute("SELECT COUNT(*) FROM file_tags").fetchone()[0]
+        overview["knowledge_db"]["diaries"] = conn.execute("SELECT COUNT(DISTINCT diary_name) FROM files").fetchone()[0]
+        conn.close()
+
+    obs_conn = sqlite3.connect(audit_logger.db_path)
+    overview["observability"]["events"] = obs_conn.execute("SELECT COUNT(*) FROM query_events").fetchone()[0]
+    obs_conn.close()
+
+    return overview
+
+
+@app.get("/v1/admin/logs/recent")
+async def admin_logs_recent(limit: int = 200, endpoint: str | None = None, status: str | None = None):
+    return {
+        "items": audit_logger.query_recent(limit=max(1, min(limit, 1000)), endpoint=endpoint, status=status)
+    }
+
+
+@app.get("/v1/admin/logs/files")
+async def admin_logs_files():
+    return {"items": audit_logger.list_jsonl_files()}
+
+
+@app.get("/v1/admin/logs/file/{file_name}")
+async def admin_logs_file(file_name: str, limit: int = 200):
+    return {"items": audit_logger.read_jsonl_file(file_name, limit=limit)}
+
+
+@app.get("/v1/admin/db/tables")
+async def admin_db_tables(source: str = "kb"):
+    db_path = _resolve_db_path(source)
+    if not db_path.exists():
+        return {"tables": []}
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()
+    conn.close()
+    return {"tables": [r[0] for r in rows]}
+
+
+@app.get("/v1/admin/db/table/{table}")
+async def admin_db_table(
+    table: str,
+    source: str = "kb",
+    page: int = 1,
+    page_size: int = 50,
+    search: str = "",
+):
+    db_path = _resolve_db_path(source)
+    if not db_path.exists():
+        return {"columns": [], "rows": [], "total": 0, "page": page, "page_size": page_size}
+
+    try:
+        table = _validate_table_name(table)
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": {"message": str(exc)}})
+    page = max(1, page)
+    page_size = max(1, min(page_size, 200))
+    offset = (page - 1) * page_size
+
+    conn = sqlite3.connect(db_path)
+    columns = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if not columns:
+        conn.close()
+        return JSONResponse(status_code=404, content={"error": {"message": "Table not found"}})
+
+    where_clause = ""
+    params: list = []
+    if search:
+        like_parts = [f"CAST({c} AS TEXT) LIKE ?" for c in columns]
+        where_clause = f"WHERE {' OR '.join(like_parts)}"
+        params.extend([f"%{search}%"] * len(columns))
+
+    total = conn.execute(f"SELECT COUNT(*) FROM {table} {where_clause}", tuple(params)).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT * FROM {table} {where_clause} LIMIT ? OFFSET ?",
+        tuple([*params, page_size, offset]),
+    ).fetchall()
+    conn.close()
+
+    items = [
+        {col: _json_safe_sql_value(val) for col, val in zip(columns, row)}
+        for row in rows
+    ]
+    return {
+        "columns": columns,
+        "rows": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@app.get("/v1/admin/diaries")
+async def admin_diaries():
+    if engine.knowledge_base is not None:
+        engine.knowledge_base.reconcile_missing_files(dry_run=False)
+
+    if not KB_DB_PATH.exists():
+        return {"items": []}
+    conn = sqlite3.connect(KB_DB_PATH)
+    rows = conn.execute(
+        """
+        SELECT diary_name, COUNT(*) AS file_count, MIN(updated_at) AS first_seen, MAX(updated_at) AS last_seen
+        FROM files
+        GROUP BY diary_name
+        ORDER BY file_count DESC, diary_name ASC
+        """
+    ).fetchall()
+    conn.close()
+    return {
+        "items": [
+            {
+                "diary_name": r[0],
+                "file_count": r[1],
+                "first_seen": r[2],
+                "last_seen": r[3],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/v1/admin/diaries/files")
+async def admin_diary_files(diary_name: str):
+    if not KB_DB_PATH.exists():
+        return {"items": []}
+    conn = sqlite3.connect(KB_DB_PATH)
+    rows = conn.execute(
+        "SELECT id, path, checksum, mtime, size, updated_at FROM files WHERE diary_name = ? ORDER BY updated_at DESC, path ASC",
+        (diary_name,),
+    ).fetchall()
+    conn.close()
+    return {
+        "items": [
+            {
+                "id": r[0],
+                "path": r[1],
+                "checksum": r[2],
+                "mtime": r[3],
+                "size": r[4],
+                "updated_at": r[5],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/v1/admin/diaries/content")
+async def admin_diary_content(path: str):
+    root = Path(engine.config.get("root_path") or os.environ.get("KNOWLEDGEBASE_ROOT_PATH", "")).resolve()
+    target = (root / path).resolve()
+    if not target.exists() or target.is_dir() or root not in target.parents:
+        return JSONResponse(status_code=404, content={"error": {"message": "File not found"}})
+    return {"path": path, "content": target.read_text(encoding="utf-8", errors="replace")}
+
+
+@app.post("/v1/admin/memory/preview")
+async def admin_memory_preview(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": {"message": "Invalid JSON body"}})
+
+    message = body.get("message")
+    if not message:
+        return JSONResponse(status_code=400, content={"error": {"message": "message is required"}})
+
+    result = await engine.query(
+        message,
+        body.get("history") or [],
+        {
+            "diary_name": body.get("diaryName"),
+            "use_rerank": True,
+        },
+    )
+    return result
+
+
+def _resolve_db_path(source: str) -> Path:
+    source_norm = (source or "kb").lower()
+    if source_norm == "audit":
+        return audit_logger.db_path
+    return KB_DB_PATH
+
+
+def _validate_table_name(table: str) -> str:
+    if not table:
+        raise ValueError("table is required")
+    if not table.replace("_", "").isalnum():
+        raise ValueError("Invalid table name")
+    return table
+
+
+def _json_safe_sql_value(value):
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        preview = base64.b64encode(raw[:96]).decode("ascii")
+        return {
+            "_type": "blob",
+            "size": len(raw),
+            "preview_base64": preview,
+        }
+    return value
+
+
+def _audit_query_event(
+    *,
+    endpoint: str,
+    request_id: str,
+    message: str,
+    diary_name: str | None,
+    history: list,
+    use_rerank: bool,
+    response_payload: dict,
+    duration_ms: float,
+    request: Request,
+    status: str,
+    error: str | None,
+) -> None:
+    metrics = response_payload.get("metrics", {}) if isinstance(response_payload, dict) else {}
+    results = response_payload.get("results", []) if isinstance(response_payload, dict) else []
+    memory_context = response_payload.get("memory_context", "") if isinstance(response_payload, dict) else ""
+    audit_logger.log_query_event(
+        endpoint=endpoint,
+        request_id=request_id,
+        message=message,
+        diary_name=diary_name,
+        history_size=len(history or []),
+        use_rerank=use_rerank,
+        memory_context=memory_context,
+        metrics=metrics,
+        results=results,
+        duration_ms=duration_ms,
+        client_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent", ""),
+        status=status,
+        error=error,
+    )
 
 
 # =================================================================
@@ -602,6 +978,44 @@ async def run_cli() -> None:
 # Entry Point
 # =================================================================
 
+def _configure_app_logging() -> None:
+    root = logging.getLogger()
+    if any(isinstance(h, RotatingFileHandler) for h in root.handlers):
+        return
+
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)-5s %(name)s [%(threadName)s]: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    root.setLevel(logging.INFO)
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    app_file = RotatingFileHandler(
+        LOG_DIR / "app.log",
+        maxBytes=20 * 1024 * 1024,
+        backupCount=10,
+        encoding="utf-8",
+    )
+    app_file.setFormatter(formatter)
+    root.addHandler(app_file)
+
+    error_file = RotatingFileHandler(
+        LOG_DIR / "error.log",
+        maxBytes=20 * 1024 * 1024,
+        backupCount=10,
+        encoding="utf-8",
+    )
+    error_file.setLevel(logging.ERROR)
+    error_file.setFormatter(formatter)
+    root.addHandler(error_file)
+
+
 def main() -> None:
     """入口：--cli 进入交互模式，否则启动 HTTP 服务。"""
     parser = argparse.ArgumentParser(description="TagMemo Server")
@@ -610,11 +1024,7 @@ def main() -> None:
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-5s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    _configure_app_logging()
 
     if args.cli:
         asyncio.run(run_cli())

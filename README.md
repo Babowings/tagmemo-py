@@ -117,6 +117,14 @@ TagMemo-py 对外暴露的 API 与原版完全兼容：
 | `/v1/chat/completions` | POST | OpenAI 兼容 Chat Completions (自动注入记忆) |
 | `/v1/memory/query` | POST | 独立记忆查询接口 |
 | `/v1/memory/delete` | POST | 删除记忆（按 path(paths) 或 diaryName，支持 dryRun） |
+| `/v1/admin/overview` | GET | 可视化后台总览（SQLite + 日志统计） |
+| `/v1/admin/logs/recent` | GET | 查询结构化日志（memory_context/metrics/results） |
+| `/v1/admin/db/tables` | GET | 列出 SQLite 表 |
+| `/v1/admin/db/table/{table}` | GET | 表数据浏览（分页 + 搜索） |
+| `/v1/admin/diaries` | GET | 日记本列表与统计 |
+| `/v1/admin/diaries/files` | GET | 指定日记本文件列表 |
+| `/v1/admin/diaries/content` | GET | 读取日记正文 |
+| `/v1/admin/memory/preview` | POST | 后台记忆检索预览 |
 | `/status` | GET | 服务状态、引擎统计、缓存命中率 |
 | `/v1/cache/clear` | POST | 清空查询缓存 |
 | `/v1/params/reload` | POST | 手动重载 rag_params.json |
@@ -142,7 +150,22 @@ curl -X POST http://localhost:3100/v1/memory/query \
 curl -X POST http://localhost:3100/v1/memory/delete \
   -H "Content-Type: application/json" \
   -d '{"diaryName": "VCP开发", "dryRun": true}'
+
+# 打开可视化后台
+# 浏览器访问: http://localhost:3100/admin
 ```
+
+## 日志与可视化后台
+
+- 结构化日志：
+  - `log/audit-YYYYMMDD.jsonl`（原始事件流）
+  - `log/observability.sqlite`（索引化查询）
+  - 每条事件包含：`message`、`diary_name`、`memory_context`、`metrics`、`results`、`duration_ms`、`status` 等
+- 应用运行日志：
+  - `log/app.log`（轮转）
+  - `log/error.log`（仅错误，轮转）
+- 可视化后台：`/admin`
+  - 总览卡片、查询日志明细、SQLite 表浏览、日记文件查看、记忆检索预览
 
 ## 项目结构
 
@@ -178,10 +201,12 @@ TagMemo-py/
 │   ├── test_time_parser.py
 │   ├── test_vector_index.py
 │   ├── test_epa.py
-│   └── test_memory_delete.py
+│   ├── test_memory_delete.py
+│   └── test_audit_logger.py
 │
 ├── data/dailynote/            知识库文档 (用户数据)
 ├── VectorStore/               向量索引 + SQLite 存储 (自动生成)
+├── web/admin/                 可视化后台前端 (日志/数据库/记忆)
 └── REFACTORING_PLAN.md        重构方案文档
 ```
 
