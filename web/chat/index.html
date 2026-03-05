@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TagMemo Chat</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; background:#0f1115; color:#e8e8e8; }
+    .wrap { max-width: 960px; margin: 0 auto; min-height: 100vh; display:flex; flex-direction:column; }
+    .top { padding: 14px; border-bottom:1px solid #242c3a; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .top input, .top select, .top button { background:#131a27; color:#e8e8e8; border:1px solid #2c3546; border-radius:8px; padding:8px 10px; }
+    .top .grow { flex:1; min-width: 220px; }
+    #messages { flex:1; padding:16px; overflow:auto; display:flex; flex-direction:column; gap:10px; }
+    .msg { border:1px solid #2a3140; border-radius:10px; padding:10px 12px; white-space:pre-wrap; line-height:1.45; }
+    .user { background:#1a2540; border-color:#3d5ea8; align-self:flex-end; max-width:85%; }
+    .assistant { background:#151b28; align-self:flex-start; max-width:92%; }
+    .system { background:#1a1a1a; border-style:dashed; color:#aab4cc; }
+    .bottom { border-top:1px solid #242c3a; padding:14px; display:grid; grid-template-columns: 1fr auto; gap:10px; }
+    textarea { width:100%; min-height:88px; resize:vertical; background:#111723; color:#e8e8e8; border:1px solid #2c3546; border-radius:10px; padding:10px; }
+    .actions { display:flex; flex-direction:column; gap:8px; }
+    .actions button { background:#1b2845; color:#dfe8ff; border:1px solid #4167b5; border-radius:8px; padding:10px 12px; cursor:pointer; }
+    .hint { font-size:12px; color:#9aa6c2; margin-top:4px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <strong>TagMemo Chat</strong>
+    <input id="baseUrl" class="grow" value="http://localhost:3100" />
+    <input id="model" placeholder="model" value="qwen3.5-plus" />
+    <select id="endpoint">
+      <option value="/v1/chat/completions">/v1/chat/completions</option>
+      <option value="/v1/chatvcp/completions">/v1/chatvcp/completions</option>
+    </select>
+    <label><input id="stream" type="checkbox" checked /> Stream</label>
+    <button id="clearBtn">清空</button>
+  </div>
+
+  <div id="messages"></div>
+
+  <div class="bottom">
+    <div>
+      <textarea id="input" placeholder="输入消息，回车发送（Shift+Enter 换行）"></textarea>
+      <div class="hint">前端会把完整历史 messages 发送给后端。</div>
+    </div>
+    <div class="actions">
+      <button id="sendBtn">发送</button>
+    </div>
+  </div>
+</div>
+
+<script src="/chat/static/app.js"></script>
+</body>
+</html>

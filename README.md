@@ -108,6 +108,11 @@ uv run python app.py --port 8080 --host 0.0.0.0
 uv run python app.py --cli
 ```
 
+启动后可直接打开内置页面：
+
+- 聊天前端：`http://localhost:3100/chat`
+- 管理后台：`http://localhost:3100/admin`
+
 ## API 端点
 
 TagMemo-py 对外暴露的 API 与原版完全兼容：
@@ -115,6 +120,7 @@ TagMemo-py 对外暴露的 API 与原版完全兼容：
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/v1/chat/completions` | POST | OpenAI 兼容 Chat Completions (自动注入记忆) |
+| `/v1/chatvcp/completions` | POST | Chat Completions（强制回显 VCP 过程信息） |
 | `/v1/memory/query` | POST | 独立记忆查询接口 |
 | `/v1/memory/delete` | POST | 删除记忆（按 path(paths) 或 diaryName，支持 dryRun） |
 | `/v1/admin/overview` | GET | 可视化后台总览（SQLite + 日志统计） |
@@ -153,6 +159,9 @@ curl -X POST http://localhost:3100/v1/memory/delete \
 
 # 打开可视化后台
 # 浏览器访问: http://localhost:3100/admin
+
+# 打开内置聊天前端
+# 浏览器访问: http://localhost:3100/chat
 ```
 
 ## 日志与可视化后台
@@ -207,6 +216,7 @@ TagMemo-py/
 ├── data/dailynote/            知识库文档 (用户数据)
 ├── VectorStore/               向量索引 + SQLite 存储 (自动生成)
 ├── web/admin/                 可视化后台前端 (日志/数据库/记忆)
+├── web/chat/                  内置聊天前端 (stream / non-stream)
 └── REFACTORING_PLAN.md        重构方案文档
 ```
 

@@ -191,6 +191,7 @@ class TagMemoEngine:
             "use_semantic_groups", self.config["enable_semantic_groups"]
         )
         use_rerank: bool = opts.get("use_rerank", False)
+        k_multiplier: float = float(opts.get("k_multiplier", 1.0) or 1.0)
 
         try:
             # 1. 更新上下文向量映射
@@ -228,6 +229,9 @@ class TagMemoEngine:
             dynamic_params = self._calculate_dynamic_params(
                 query_vector, clean_user, clean_ai
             )
+            if abs(k_multiplier - 1.0) > 1e-9:
+                dynamic_params["k"] = max(1, min(30, int(round(dynamic_params["k"] * k_multiplier))))
+                dynamic_params["metrics"]["k_multiplier"] = k_multiplier
 
             # 6. 语义组增强
             final_query_vector = query_vector

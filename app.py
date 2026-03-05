@@ -28,6 +28,7 @@ import os
 import sqlite3
 import sys
 import time
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -41,6 +42,15 @@ from fastapi.staticfiles import StaticFiles
 
 from tagmemo.audit_logger import AuditLogger
 from tagmemo.engine import TagMemoEngine
+from tagmemo.vcp_compat import (
+    VCPPlaceholderProcessor,
+    build_tool_payload_for_rag,
+    extract_ai_text_from_response_payload,
+    extract_daily_note_payload,
+    parse_tool_requests,
+    replace_variable_placeholders,
+    write_daily_note,
+)
 
 # --------------- 环境变量 ---------------
 _config_env = Path(__file__).resolve().parent / "config.env"
@@ -68,11 +78,18 @@ LOG_DIR = Path(__file__).resolve().parent / "log"
 LOG_DIR.mkdir(exist_ok=True)
 BASE_DIR = Path(__file__).resolve().parent
 WEB_ADMIN_DIR = BASE_DIR / "web" / "admin"
+WEB_CHAT_DIR = BASE_DIR / "web" / "chat"
 KB_DB_PATH = BASE_DIR / "VectorStore" / "knowledge_base.sqlite"
 
 # --------------- Engine (全局单例) ---------------
 engine = TagMemoEngine()
 audit_logger = AuditLogger(LOG_DIR)
+vcp_placeholder_processor = VCPPlaceholderProcessor(engine)
+
+MAX_VCP_LOOP_NONSTREAM = int(os.environ.get("MAX_VCP_LOOP_NONSTREAM", "5"))
+MAX_VCP_LOOP_STREAM = int(os.environ.get("MAX_VCP_LOOP_STREAM", "5"))
+RAG_MEMO_REFRESH = os.environ.get("RAG_MEMO_REFRESH", "true").lower() == "true"
+SSE_KEEPALIVE_SECONDS = float(os.environ.get("SSE_KEEPALIVE_SECONDS", "5"))
 
 
 # =================================================================
@@ -93,6 +110,8 @@ app = FastAPI(title="TagMemo", lifespan=lifespan)
 
 if WEB_ADMIN_DIR.exists():
     app.mount("/admin/static", StaticFiles(directory=str(WEB_ADMIN_DIR)), name="admin-static")
+if WEB_CHAT_DIR.exists():
+    app.mount("/chat/static", StaticFiles(directory=str(WEB_CHAT_DIR)), name="chat-static")
 
 # CORS（对应 app.use(cors())）
 app.add_middleware(
@@ -162,8 +181,27 @@ async def admin_dashboard():
     return FileResponse(index_path)
 
 
+@app.get("/chat")
+async def chat_frontend():
+    if not WEB_CHAT_DIR.exists():
+        return JSONResponse(status_code=404, content={"error": {"message": "Chat UI not found"}})
+    index_path = WEB_CHAT_DIR / "index.html"
+    if not index_path.exists():
+        return JSONResponse(status_code=404, content={"error": {"message": "Chat index missing"}})
+    return FileResponse(index_path)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    return await _chat_completions_impl(request, force_show_vcp=False)
+
+
+@app.post("/v1/chatvcp/completions")
+async def chatvcp_completions(request: Request):
+    return await _chat_completions_impl(request, force_show_vcp=True)
+
+
+async def _chat_completions_impl(request: Request, force_show_vcp: bool):
     """OpenAI 兼容的 Chat Completions 端点。"""
     request_id = str(uuid.uuid4())
     start_ts = time.perf_counter()
@@ -204,6 +242,22 @@ async def chat_completions(request: Request):
     conversation_history = [
         m for m in messages[:last_user_idx] if m.get("role") != "system"
     ]
+
+    system_messages = [m for m in messages if m.get("role") == "system" and isinstance(m.get("content"), str)]
+    if system_messages:
+        preprocessed = []
+        root_path = engine.config.get("root_path") or os.environ.get("KNOWLEDGEBASE_ROOT_PATH", "")
+        for msg in messages:
+            cloned = json.loads(json.dumps(msg))
+            if cloned.get("role") == "system" and isinstance(cloned.get("content"), str):
+                cloned["content"] = replace_variable_placeholders(cloned["content"], root_path)
+            preprocessed.append(cloned)
+        last_ai_before_user = _extract_last_assistant_before(preprocessed, last_user_idx)
+        messages = await vcp_placeholder_processor.process_system_messages(
+            preprocessed,
+            user_content=user_message,
+            ai_content=last_ai_before_user,
+        )
 
     # TagMemo 记忆检索
     logger.info('[App] Query: "%s..."', user_message[:80])
@@ -262,9 +316,9 @@ async def chat_completions(request: Request):
 
     if CHAT_API_URL:
         if stream:
-            return await _handle_stream_response(upstream_body, metrics)
+            return await _handle_stream_response(upstream_body, metrics, force_show_vcp=force_show_vcp)
         else:
-            return await _handle_normal_response(upstream_body, metrics)
+            return await _handle_normal_response(upstream_body, metrics, force_show_vcp=force_show_vcp)
     else:
         # 调试模式：无上游 API，直接返回记忆检索结果
         return {
@@ -358,6 +412,21 @@ async def memory_query(request: Request):
             error=str(exc),
         )
         return JSONResponse(status_code=500, content={"error": {"message": str(exc)}})
+
+
+@app.post("/v1/human/tool")
+async def human_tool(request: Request):
+    raw_body = (await request.body()).decode("utf-8", errors="replace")
+    if not raw_body.strip():
+        return JSONResponse(status_code=400, content={"error": "Request body must be non-empty plain text."})
+
+    tool_calls = parse_tool_requests(raw_body)
+    if not tool_calls:
+        return JSONResponse(status_code=400, content={"error": "Malformed request: Missing TOOL_REQUEST markers."})
+
+    first = tool_calls[0]
+    result = await _execute_compatible_tool(first["tool_name"], first.get("params") or {})
+    return result
 
 
 @app.post("/v1/memory/delete")
@@ -728,93 +797,265 @@ def _audit_query_event(
 # Upstream Proxy
 # =================================================================
 
-async def _handle_normal_response(body: dict, tagmemo_metrics: dict):
+async def _handle_normal_response(body: dict, tagmemo_metrics: dict, *, force_show_vcp: bool = False):
     """非流式转发：向上游 Chat API 发送请求并返回 JSON 响应。"""
-    async with httpx.AsyncClient(timeout=120.0) as client:
-        try:
-            resp = await client.post(
-                CHAT_API_URL,
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {CHAT_API_KEY}",
-                },
-                json=body,
-            )
-        except httpx.RequestError as exc:
-            logger.error("[App] Upstream request failed: %s", exc)
+    current_messages = json.loads(json.dumps(body.get("messages") or []))
+    latest_data: dict | None = None
+    vcp_history: list[str] = []
+
+    for depth in range(MAX_VCP_LOOP_NONSTREAM + 1):
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            try:
+                resp = await client.post(
+                    CHAT_API_URL,
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {CHAT_API_KEY}",
+                    },
+                    json={**body, "messages": current_messages, "stream": False},
+                )
+            except httpx.RequestError as exc:
+                logger.error("[App] Upstream request failed: %s", exc)
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": f"Upstream connection error: {exc}"}},
+                )
+
+        if resp.status_code != 200:
+            error_text = resp.text[:500]
+            logger.error("[App] Upstream error %d: %s", resp.status_code, error_text[:200])
             return JSONResponse(
-                status_code=502,
-                content={"error": {"message": f"Upstream connection error: {exc}"}},
+                status_code=resp.status_code,
+                content={
+                    "error": {
+                        "message": f"Upstream API error: {resp.status_code}",
+                        "detail": error_text,
+                    }
+                },
             )
 
-    if resp.status_code != 200:
-        error_text = resp.text[:500]
-        logger.error("[App] Upstream error %d: %s", resp.status_code, error_text[:200])
-        return JSONResponse(
-            status_code=resp.status_code,
-            content={
-                "error": {
-                    "message": f"Upstream API error: {resp.status_code}",
-                    "detail": error_text,
-                }
-            },
-        )
+        latest_data = resp.json()
+        choices = latest_data.get("choices") or []
+        assistant_content = ""
+        if choices:
+            assistant_content = ((choices[0].get("message") or {}).get("content")) or ""
 
-    data = resp.json()
-    data["tagmemo_metrics"] = tagmemo_metrics
-    return data
+        await _handle_diary_from_ai_response(assistant_content)
+        vcp_history.append(assistant_content)
+        tool_calls = parse_tool_requests(assistant_content)
+        if not tool_calls or depth >= MAX_VCP_LOOP_NONSTREAM:
+            break
+
+        current_messages.append({"role": "assistant", "content": assistant_content})
+        tool_outputs = []
+        for tc in tool_calls:
+            output = await _execute_compatible_tool(tc["tool_name"], tc.get("params") or {})
+            tool_outputs.append({
+                "tool_name": tc["tool_name"],
+                "status": "success" if not output.get("error") else "error",
+                "content": output,
+            })
+
+        if RAG_MEMO_REFRESH:
+            current_messages = await vcp_placeholder_processor.refresh_rag_blocks_if_needed(
+                current_messages,
+                new_context={
+                    "lastAiMessage": assistant_content,
+                    "toolResultsText": build_tool_payload_for_rag(tool_outputs),
+                },
+            )
+
+        tool_payload = f"<!-- VCP_TOOL_PAYLOAD -->\n{build_tool_payload_for_rag(tool_outputs)}"
+        current_messages.append({"role": "user", "content": tool_payload})
+
+        if force_show_vcp:
+            vcp_history.append(f"\n[VCP_TOOL_RESULTS]\n{build_tool_payload_for_rag(tool_outputs)}")
+
+    if latest_data is None:
+        return JSONResponse(status_code=500, content={"error": {"message": "Upstream returned empty response"}})
+
+    latest_data["tagmemo_metrics"] = tagmemo_metrics
+    if force_show_vcp and latest_data.get("choices"):
+        final_msg = latest_data["choices"][0].get("message") or {}
+        final_content = final_msg.get("content") or ""
+        final_msg["content"] = "".join(vcp_history[:-1]) + final_content
+        latest_data["choices"][0]["message"] = final_msg
+    return latest_data
 
 
-async def _handle_stream_response(body: dict, tagmemo_metrics: dict):
-    """流式转发：SSE 字节流透传（不使用 sse_starlette 生成事件）。
+def _build_sse_data(payload: dict) -> bytes:
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\\n\\n".encode("utf-8")
 
-    与原版 response.body.pipe(res) 完全一致 — 原封不动透传上游字节。
-    TagMemo 指标通过 X-TagMemo-Metrics 自定义响应头附加。
-    """
-    client = httpx.AsyncClient(timeout=120.0)
-    try:
-        req = client.build_request(
-            "POST",
-            CHAT_API_URL,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {CHAT_API_KEY}",
-            },
-            json=body,
-        )
-        resp = await client.send(req, stream=True)
-    except httpx.RequestError as exc:
-        await client.aclose()
-        logger.error("[App] Upstream stream request failed: %s", exc)
-        return JSONResponse(
-            status_code=502,
-            content={"error": {"message": f"Upstream connection error: {exc}"}},
-        )
 
-    if resp.status_code != 200:
-        error_text = (await resp.aread()).decode(errors="replace")[:500]
-        await resp.aclose()
-        await client.aclose()
-        return JSONResponse(
-            status_code=resp.status_code,
-            content={"error": {"message": f"Upstream API error: {resp.status_code}"}},
-        )
+def _build_sse_comment(comment: str) -> bytes:
+    safe = (comment or "keepalive").replace("\n", " ").replace("\r", " ")
+    return f": {safe}\\n\\n".encode("utf-8")
 
-    async def _stream_generator():
-        try:
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-        except Exception as exc:
-            logger.error("[App] Stream error: %s", exc)
-        finally:
-            await resp.aclose()
-            await client.aclose()
 
+def _build_sse_text_chunk(text: str, *, finish_reason=None) -> bytes:
+    payload = {
+        "id": f"chatcmpl-vcp-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}",
+        "object": "chat.completion.chunk",
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"content": text},
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    return _build_sse_data(payload)
+
+
+async def _handle_stream_response(body: dict, tagmemo_metrics: dict, *, force_show_vcp: bool = False):
+    """流式转发 + VCP 工具循环（对齐 streamHandler.js 核心行为）。"""
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        "X-TagMemo-Metrics": json.dumps(tagmemo_metrics, ensure_ascii=False),
+        "X-TagMemo-Metrics": json.dumps(tagmemo_metrics, ensure_ascii=True),
     }
+
+    async def _stream_generator():
+        current_messages = json.loads(json.dumps(body.get("messages") or []))
+        request_template = {k: v for k, v in body.items() if k != "messages"}
+
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            for depth in range(MAX_VCP_LOOP_STREAM + 1):
+                try:
+                    req = client.build_request(
+                        "POST",
+                        CHAT_API_URL,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {CHAT_API_KEY}",
+                        },
+                        json={**request_template, "messages": current_messages, "stream": True},
+                    )
+                    resp = await client.send(req, stream=True)
+                except httpx.RequestError as exc:
+                    logger.error("[App] Upstream stream request failed: %s", exc)
+                    payload = {"error": {"message": f"Upstream connection error: {exc}"}}
+                    yield _build_sse_data(payload)
+                    break
+
+                if resp.status_code != 200:
+                    error_text = (await resp.aread()).decode(errors="replace")[:500]
+                    await resp.aclose()
+                    payload = {
+                        "error": {
+                            "message": f"Upstream API error: {resp.status_code}",
+                            "detail": error_text,
+                        }
+                    }
+                    yield _build_sse_data(payload)
+                    break
+
+                assistant_content_parts: list[str] = []
+                raw_text_parts: list[str] = []
+                line_buffer = ""
+
+                try:
+                    stream_iter = resp.aiter_bytes().__aiter__()
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(stream_iter.__anext__(), timeout=SSE_KEEPALIVE_SECONDS)
+                        except asyncio.TimeoutError:
+                            yield _build_sse_comment("vcp-keepalive")
+                            continue
+                        except StopAsyncIteration:
+                            break
+
+                        chunk_text = chunk.decode("utf-8", errors="replace")
+                        raw_text_parts.append(chunk_text)
+                        line_buffer += chunk_text
+
+                        while "\n" in line_buffer:
+                            line, line_buffer = line_buffer.split("\n", 1)
+                            line = line.rstrip("\r")
+
+                            if line.startswith("data: "):
+                                payload_text = line[6:].strip()
+                                if payload_text == "[DONE]":
+                                    continue
+                                try:
+                                    obj = json.loads(payload_text)
+                                    delta = ((obj.get("choices") or [{}])[0].get("delta") or {})
+                                    msg = ((obj.get("choices") or [{}])[0].get("message") or {})
+                                    content_piece = delta.get("content") or msg.get("content") or ""
+                                    if content_piece:
+                                        assistant_content_parts.append(content_piece)
+                                except Exception:
+                                    pass
+
+                            yield (line + "\n").encode("utf-8")
+
+                    if line_buffer:
+                        line = line_buffer.rstrip("\r")
+                        if line.startswith("data: "):
+                            payload_text = line[6:].strip()
+                            if payload_text and payload_text != "[DONE]":
+                                try:
+                                    obj = json.loads(payload_text)
+                                    delta = ((obj.get("choices") or [{}])[0].get("delta") or {})
+                                    msg = ((obj.get("choices") or [{}])[0].get("message") or {})
+                                    content_piece = delta.get("content") or msg.get("content") or ""
+                                    if content_piece:
+                                        assistant_content_parts.append(content_piece)
+                                except Exception:
+                                    pass
+                        yield (line + "\n").encode("utf-8")
+                finally:
+                    await resp.aclose()
+
+                raw_text = "".join(raw_text_parts)
+                assistant_content = "".join(assistant_content_parts)
+                try:
+                    await _handle_diary_from_ai_response(raw_text)
+                except Exception as exc:
+                    logger.warning("[App] Failed to handle diary from stream response: %s", exc)
+
+                tool_calls = parse_tool_requests(assistant_content)
+                if not tool_calls or depth >= MAX_VCP_LOOP_STREAM:
+                    break
+
+                current_messages.append({"role": "assistant", "content": assistant_content})
+                tool_outputs = []
+                for tc in tool_calls:
+                    if force_show_vcp:
+                        yield _build_sse_text_chunk(f"\n🔍 正在执行工具: {tc['tool_name']}\n")
+
+                    tool_task = asyncio.create_task(_execute_compatible_tool(tc["tool_name"], tc.get("params") or {}))
+                    while not tool_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(tool_task), timeout=SSE_KEEPALIVE_SECONDS)
+                        except asyncio.TimeoutError:
+                            yield _build_sse_comment("vcp-keepalive")
+                    output = await tool_task
+                    tool_outputs.append({
+                        "tool_name": tc["tool_name"],
+                        "status": "success" if not output.get("error") else "error",
+                        "content": output,
+                    })
+
+                if RAG_MEMO_REFRESH:
+                    current_messages = await vcp_placeholder_processor.refresh_rag_blocks_if_needed(
+                        current_messages,
+                        new_context={
+                            "lastAiMessage": assistant_content,
+                            "toolResultsText": build_tool_payload_for_rag(tool_outputs),
+                        },
+                    )
+
+                tool_payload_text = build_tool_payload_for_rag(tool_outputs)
+                if force_show_vcp:
+                    yield _build_sse_text_chunk(f"\n[VCP_TOOL_RESULTS]\n{tool_payload_text}\n")
+
+                tool_payload = f"<!-- VCP_TOOL_PAYLOAD -->\n{tool_payload_text}"
+                current_messages.append({"role": "user", "content": tool_payload})
+
+                yield _build_sse_text_chunk("\n")
+
+            yield b"data: [DONE]\n\n"
 
     return StreamingResponse(
         _stream_generator(),
@@ -867,6 +1108,90 @@ def _find_last_index(arr: list, predicate) -> int:
         if predicate(arr[i]):
             return i
     return -1
+
+
+def _extract_last_assistant_before(messages: list[dict], idx: int) -> str:
+    for i in range(idx - 1, -1, -1):
+        m = messages[i]
+        if m.get("role") == "assistant":
+            content = m.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return next((p.get("text", "") for p in content if p.get("type") == "text"), "")
+    return ""
+
+
+async def _handle_diary_from_ai_response(response_text: str) -> None:
+    ai_text = extract_ai_text_from_response_payload(response_text)
+    payload = extract_daily_note_payload(ai_text)
+    if not payload:
+        return
+
+    root_path = engine.config.get("root_path") or os.environ.get("KNOWLEDGEBASE_ROOT_PATH", "")
+    if not root_path:
+        return
+
+    target = await asyncio.to_thread(
+        write_daily_note,
+        root_path,
+        payload["maid_name"],
+        payload["date_string"],
+        payload["content_text"],
+    )
+    logger.info("[DailyNote] Saved %s", str(target))
+
+    if engine.knowledge_base is not None:
+        try:
+            engine.knowledge_base._on_file_event(str(target))
+        except Exception as exc:
+            logger.warning("[DailyNote] Queue ingestion failed: %s", exc)
+
+
+async def _execute_compatible_tool(tool_name: str, params: dict[str, str]) -> dict:
+    name = (tool_name or "").strip().lower()
+    try:
+        if name in {"tagmemomemoryquery", "memoryquery", "tagmemo_query", "tagmemo.memory.query"}:
+            message = params.get("message") or params.get("query") or ""
+            history = []
+            result = await engine.query(
+                message,
+                history,
+                {
+                    "diary_name": params.get("diaryName") or params.get("diary_name") or None,
+                    "use_rerank": str(params.get("useRerank", "false")).lower() == "true",
+                },
+            )
+            return {"status": "success", "result": result}
+
+        if name in {"tagmemomemorydelete", "memorydelete", "tagmemo_delete", "tagmemo.memory.delete"}:
+            paths_raw = params.get("paths") or params.get("path") or ""
+            if paths_raw.strip().startswith("["):
+                try:
+                    parsed = json.loads(paths_raw)
+                    file_paths = [str(x) for x in parsed if x]
+                except Exception:
+                    file_paths = [p.strip() for p in paths_raw.split(",") if p.strip()]
+            else:
+                file_paths = [p.strip() for p in paths_raw.split(",") if p.strip()]
+            result = await engine.delete_memory(
+                file_paths=file_paths,
+                diary_name=params.get("diaryName") or params.get("diary_name") or None,
+                dry_run=str(params.get("dryRun", "false")).lower() == "true",
+                cleanup_orphans=True,
+            )
+            return {"status": "success", "result": result}
+
+        return {
+            "error": "ToolNotSupported",
+            "details": f"Unsupported tool_name: {tool_name}",
+        }
+    except Exception as exc:
+        return {
+            "error": "ToolExecutionError",
+            "details": str(exc),
+            "trace": traceback.format_exc(limit=2),
+        }
 
 
 # =================================================================
