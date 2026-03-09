@@ -110,7 +110,7 @@ async def get_embeddings_batch(
     config: dict,
     *,
     concurrency: int = _DEFAULT_CONCURRENCY,
-) -> list[list[float]]:
+) -> list[list[float] | None]:
     """并发批量获取 Embedding 向量。
 
     Parameters
@@ -124,55 +124,76 @@ async def get_embeddings_batch(
 
     Returns
     -------
-    list[list[float]]
-        与输入文本一一对应的向量列表（超长文本被跳过后会缺位）。
+    list[list[float] | None]
+        与输入文本严格一一对应的向量列表；失败或超长文本位置为 ``None``。
     """
     if not texts:
         return []
 
-    # 1. 按 token 数 / 条数分批
-    batches: list[list[str]] = []
+    # 1. 按 token 数 / 条数分批，同时记录原始位置
+    batches: list[dict[str, list]] = []
     current_batch: list[str] = []
+    current_indices: list[int] = []
     current_tokens = 0
+    oversize_indices: set[int] = set()
 
-    for text in texts:
+    for idx, text in enumerate(texts):
         text_tokens = len(_encoding.encode(text))
         if text_tokens > _safe_max_tokens:
-            continue  # 跳过超长文本（与 JS 版一致）
+            oversize_indices.add(idx)
+            continue
 
         token_full = len(current_batch) > 0 and (current_tokens + text_tokens > _safe_max_tokens)
         item_full = len(current_batch) >= _MAX_BATCH_ITEMS
 
         if token_full or item_full:
-            batches.append(current_batch)
+            batches.append({"texts": current_batch, "indices": current_indices})
             current_batch = [text]
+            current_indices = [idx]
             current_tokens = text_tokens
         else:
             current_batch.append(text)
+            current_indices.append(idx)
             current_tokens += text_tokens
 
     if current_batch:
-        batches.append(current_batch)
+        batches.append({"texts": current_batch, "indices": current_indices})
 
     if not batches:
-        return []
+        return [None] * len(texts)
 
     # 2. 受控并发（Semaphore 替代 JS worker pool）
     # 共享单个 AsyncClient 以复用连接池，与原版 JS worker pool 共享 fetch 实例一致
     sem = asyncio.Semaphore(concurrency)
-    results: list[list[list[float]] | None] = [None] * len(batches)
+    results: list[dict | None] = [None] * len(batches)
 
     async with httpx.AsyncClient() as client:
 
         async def _worker(idx: int) -> None:
             async with sem:
-                results[idx] = await _send_batch(client, batches[idx], config, idx + 1)
+                batch = batches[idx]
+                try:
+                    vectors = await _send_batch(client, batch["texts"], config, idx + 1)
+                except Exception as exc:
+                    logger.error(
+                        "[Embedding] Batch %d failed permanently: %s",
+                        idx + 1,
+                        exc,
+                    )
+                    vectors = None
+                results[idx] = {"vectors": vectors, "indices": batch["indices"]}
 
         await asyncio.gather(*[_worker(i) for i in range(len(batches))])
 
-    # 3. 扁平化
-    flat: list[list[float]] = []
+    # 3. 按原始顺序回填，保证 output.length === input.length
+    final_results: list[list[float] | None] = [None] * len(texts)
     for r in results:
-        if r:
-            flat.extend(r)
-    return flat
+        if not r or not r["vectors"]:
+            continue
+        for vec_idx, original_idx in enumerate(r["indices"]):
+            final_results[original_idx] = r["vectors"][vec_idx] if vec_idx < len(r["vectors"]) else None
+
+    for oversize_idx in oversize_indices:
+        final_results[oversize_idx] = None
+
+    return final_results

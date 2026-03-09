@@ -6,6 +6,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
+import secrets
 from typing import Any
 
 
@@ -90,13 +93,82 @@ def write_daily_note(root_path: str, maid_name: str, date_string: str, content_t
     target_dir.mkdir(parents=True, exist_ok=True)
 
     target_file = target_dir / f"{safe_date}-{safe_alias}.md"
-    body = f"[{date_string}] - {alias}\n\n{content_text}\n"
+    processed_content = _rewrite_local_file_urls(content_text)
+    body = f"[{date_string}] - {alias}\n\n{processed_content}\n"
     target_file.write_text(body, encoding="utf-8")
     return target_file
 
 
 def _safe_name(value: str) -> str:
     return re.sub(r"[\\/:*?\"<>|]", "_", value).strip() or "untitled"
+
+
+def _safe_asset_name(value: str) -> str:
+    cleaned = re.sub(r"[\\/:*?\"<>|]", "_", value)
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = re.sub(r"_+", "_", cleaned).strip("_")
+    return (cleaned[:80] if cleaned else "file")
+
+
+def _file_uri_to_path(file_url: str) -> Path | None:
+    parsed = urlparse(file_url)
+    if parsed.scheme != "file":
+        return None
+    raw_path = unquote(parsed.path or "")
+    resolved_path = url2pathname(raw_path)
+    if os.name == "nt" and resolved_path.startswith("/") and len(resolved_path) > 2 and resolved_path[2] == ":":
+        resolved_path = resolved_path[1:]
+    if not resolved_path:
+        return None
+    return Path(resolved_path)
+
+
+def _rewrite_local_file_urls(content_text: str) -> str:
+    project_base_path = os.environ.get("PROJECT_BASE_PATH")
+    server_port = os.environ.get("SERVER_PORT")
+    var_http_url = os.environ.get("VarHttpUrl")
+    image_key = os.environ.get("IMAGESERVER_IMAGE_KEY")
+    file_key = os.environ.get("IMAGESERVER_FILE_KEY")
+
+    if not project_base_path or not server_port or not var_http_url:
+        return content_text
+
+    result = content_text
+    project_base = Path(project_base_path)
+
+    def _copy_asset(file_url: str, *, kind: str, key: str | None, default_ext: str) -> str | None:
+        if not key:
+            return None
+        source_path = _file_uri_to_path(file_url)
+        if source_path is None or not source_path.exists() or not source_path.is_file():
+            return None
+
+        ext = source_path.suffix.lower() or default_ext
+        base_name = _safe_asset_name(source_path.stem)
+        generated_name = f"{secrets.token_hex(4)}_{base_name}{ext}"
+        dest_dir = project_base / kind / "dailynote"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_path = dest_dir / generated_name
+        dest_path.write_bytes(source_path.read_bytes())
+
+        route = "images" if kind == "image" else "files"
+        return f"{var_http_url}:{server_port}/pw={key}/{route}/dailynote/{generated_name}"
+
+    if image_key:
+        image_matches = list(re.finditer(r"!\[([^\]]*)\]\((file://[^)]+)\)", result))
+        for match in image_matches:
+            replacement = _copy_asset(match.group(2), kind="image", key=image_key, default_ext=".png")
+            if replacement:
+                result = result.replace(match.group(0), f"![{match.group(1)}]({replacement})", 1)
+
+    if file_key:
+        file_matches = list(re.finditer(r"(?<!!)\[([^\]]*)\]\((file://[^)]+)\)", result))
+        for match in file_matches:
+            replacement = _copy_asset(match.group(2), kind="file", key=file_key, default_ext=".bin")
+            if replacement:
+                result = result.replace(match.group(0), f"[{match.group(1)}]({replacement})", 1)
+
+    return result
 
 
 def replace_variable_placeholders(text: str, root_path: str) -> str:

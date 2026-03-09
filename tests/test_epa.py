@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from tagmemo.epa import EPAModule
+from tagmemo.context_vector import ContextVectorManager
 
 
 def _seed_tags(conn: sqlite3.Connection, dim: int = 128, n: int = 20) -> None:
@@ -90,6 +91,31 @@ class TestEPAModuleProject:
         query_vec = rng.standard_normal(dim).astype(np.float32)
         result = epa.detect_cross_domain_resonance(query_vec)
         assert result is not None
+
+    def test_project_logic_depth_uses_projection_entropy(self, memory_db: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+        epa = EPAModule(memory_db, config={"dimension": 4})
+        epa.initialized = True
+        epa.ortho_basis = [
+            np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        ]
+        epa.basis_mean = np.zeros(4, dtype=np.float32)
+        epa.basis_labels = ["a", "b"]
+
+        def _fake_project(_vector, _basis, _mean):
+            return {
+                "projections": [0.5, 0.5],
+                "probabilities": [0.5, 0.5],
+                "entropy": 1.0,
+                "total_energy": 1.0,
+            }
+
+        monkeypatch.setattr("tagmemo.epa.VectorIndex.project", _fake_project)
+
+        query_vec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+        result = epa.project(query_vec)
+
+        assert result["logic_depth"] == 1.0 - result["entropy"]
 
 
 class TestEPAModuleComputeWeightedPCA:

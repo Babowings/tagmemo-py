@@ -142,6 +142,39 @@ class ContextVectorManager:
         self.history_user_vectors = [e["vector"] for e in sorted(new_user, key=lambda x: x["index"])]
 
     # ------------------------------------------------------------------
+    # 逻辑深度
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def compute_logic_depth(vector: list[float] | np.ndarray | None, top_k: int = 64) -> float:
+        if vector is None:
+            return 0.0
+        v = np.asarray(vector, dtype=np.float32)
+        dim = v.size
+        if dim == 0:
+            return 0.0
+
+        energies = np.square(v, dtype=np.float32)
+        total_energy = float(np.sum(energies))
+        if total_energy < 1e-9:
+            return 0.0
+
+        actual_top_k = min(top_k, dim)
+        if actual_top_k <= 0:
+            return 0.0
+
+        sorted_energies = np.sort(energies)[::-1]
+        top_k_energy = float(np.sum(sorted_energies[:actual_top_k]))
+        concentration = top_k_energy / total_energy
+        expected_uniform = actual_top_k / dim
+
+        if expected_uniform >= 1.0:
+            return 1.0
+
+        logic_depth = (concentration - expected_uniform) / (1 - expected_uniform)
+        return max(0.0, min(1.0, logic_depth))
+
+    # ------------------------------------------------------------------
     # 语义宽度
     # ------------------------------------------------------------------
 
@@ -150,7 +183,20 @@ class ContextVectorManager:
         if vector is None:
             return 0.0
         v = np.asarray(vector, dtype=np.float32)
-        return float(np.linalg.norm(v)) * 1.2
+        dim = v.size
+        if dim == 0:
+            return 0.0
+
+        entropy = 0.0
+        for value in v:
+            probability = float(value * value)
+            if probability > 1e-12:
+                entropy -= probability * float(np.log(probability))
+
+        max_entropy = float(np.log(dim))
+        if max_entropy <= 0:
+            return 0.0
+        return entropy / max_entropy
 
     # ------------------------------------------------------------------
     # 语义分段

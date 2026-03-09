@@ -65,6 +65,8 @@ class KnowledgeBaseManager:
             "max_batch_size":   int(os.environ.get("KNOWLEDGEBASE_MAX_BATCH_SIZE", "50")),
             "index_save_delay": int(os.environ.get("KNOWLEDGEBASE_INDEX_SAVE_DELAY", "120000")) / 1000.0,
             "tag_index_save_delay": int(os.environ.get("KNOWLEDGEBASE_TAG_INDEX_SAVE_DELAY", "300000")) / 1000.0,
+            "index_idle_ttl": int(os.environ.get("KNOWLEDGEBASE_INDEX_IDLE_TTL_MS", "7200000")) / 1000.0,
+            "index_idle_sweep_interval": int(os.environ.get("KNOWLEDGEBASE_INDEX_IDLE_SWEEP_MS", "600000")) / 1000.0,
 
             "ignore_folders":  [f.strip() for f in os.environ.get("IGNORE_FOLDERS", "").split(",") if f.strip()],
             "ignore_prefixes": [p.strip() for p in os.environ.get("IGNORE_PREFIXES", "").split(",") if p.strip()],
@@ -86,14 +88,17 @@ class KnowledgeBaseManager:
 
         self.db: sqlite3.Connection | None = None
         self.diary_indices: dict[str, VectorIndex] = {}
+        self.diary_index_last_used: dict[str, float] = {}
         self.tag_index: VectorIndex | None = None
         self.watcher = None  # watchdog.Observer
         self.initialized = False
         self.diary_name_vector_cache: dict[str, list[float]] = {}
         self.pending_files: set[str] = set()
+        self.file_retry_count: dict[str, int] = {}
         self._batch_timer: threading.Timer | None = None
         self._is_processing = False
         self._save_timers: dict[str, threading.Timer] = {}
+        self._idle_sweep_timer: threading.Timer | None = None
         self.tag_cooccurrence_matrix: dict[int, dict[int, int]] | None = None
         self.epa: EPAModule | None = None
         self.residual_pyramid: ResidualPyramid | None = None
@@ -156,6 +161,7 @@ class KnowledgeBaseManager:
 
         self._start_watcher()
         await self.load_rag_params()
+        self._start_idle_sweep()
 
         self.initialized = True
         logger.info("[KnowledgeBase] System Ready")
@@ -228,12 +234,52 @@ class KnowledgeBaseManager:
     # =================================================================
 
     def _get_or_load_diary_index(self, diary_name: str) -> VectorIndex:
+        self.diary_index_last_used[diary_name] = time.time()
         if diary_name in self.diary_indices:
             return self.diary_indices[diary_name]
         safe_name = hashlib.md5(diary_name.encode()).hexdigest()
         idx = self._load_or_build_index(f"diary_{safe_name}", 50000, "chunks", diary_name)
         self.diary_indices[diary_name] = idx
         return idx
+
+    def _start_idle_sweep(self) -> None:
+        interval = float(self.config.get("index_idle_sweep_interval", 0) or 0)
+        if interval <= 0 or self._idle_sweep_timer is not None:
+            return
+
+        def _run() -> None:
+            self._idle_sweep_timer = None
+            try:
+                self._evict_idle_indices()
+            finally:
+                if self.db is not None:
+                    self._start_idle_sweep()
+
+        timer = threading.Timer(interval, _run)
+        timer.daemon = True
+        self._idle_sweep_timer = timer
+        timer.start()
+
+    def _evict_idle_indices(self, *, now: float | None = None) -> None:
+        current_time = time.time() if now is None else now
+        ttl = float(self.config.get("index_idle_ttl", 0) or 0)
+        if ttl <= 0:
+            return
+
+        for diary_name, last_used in list(self.diary_index_last_used.items()):
+            if current_time - last_used < ttl:
+                continue
+            if diary_name not in self.diary_indices:
+                self.diary_index_last_used.pop(diary_name, None)
+                continue
+
+            timer = self._save_timers.pop(diary_name, None)
+            if timer is not None:
+                timer.cancel()
+
+            self._save_index_to_disk(diary_name)
+            self.diary_indices.pop(diary_name, None)
+            self.diary_index_last_used.pop(diary_name, None)
 
     def _load_or_build_index(
         self, file_name: str, capacity: int, table_type: str, filter_diary: str | None = None,
@@ -286,24 +332,59 @@ class KnowledgeBaseManager:
     # =================================================================
 
     async def search(
-        self, diary_name: str | None, query_vec: list[float], k: int = 5,
-        tag_boost: float = 0.0, core_tags: list[str] | None = None,
+        self,
+        arg1,
+        arg2=None,
+        arg3: int = 5,
+        arg4: float = 0.0,
+        arg5: list[str] | None = None,
+        arg6: float = 1.33,
     ) -> list[dict]:
+        diary_name: str | None = None
+        query_vec = None
+        k = 5
+        tag_boost = 0.0
+        core_tags = arg5 or []
+        core_boost_factor = arg6
+
+        if isinstance(arg1, str) and isinstance(arg2, list):
+            diary_name = arg1
+            query_vec = arg2
+            k = arg3 or 5
+            tag_boost = arg4 or 0.0
+            core_tags = arg5 or []
+            core_boost_factor = arg6 or 1.33
+        elif arg1 is None and isinstance(arg2, list):
+            # search(None, vector, k, tag_boost, core_tags, coreBoostFactor)
+            diary_name = None
+            query_vec = arg2
+            k = arg3 or 5
+            tag_boost = arg4 or 0.0
+            core_tags = arg5 or []
+            core_boost_factor = arg6 or 1.33
+        elif isinstance(arg1, str):
+            return []
+        elif isinstance(arg1, list):
+            query_vec = arg1
+            k = arg2 or 5
+            tag_boost = arg3 or 0.0
+            core_tags = arg4 or []
+            core_boost_factor = arg5 or 1.33
+
         if not query_vec:
             return []
-        core_tags = core_tags or []
         try:
             if diary_name:
-                return self._search_specific_index(diary_name, query_vec, k, tag_boost, core_tags)
+                return self._search_specific_index(diary_name, query_vec, k, tag_boost, core_tags, core_boost_factor)
             else:
-                return self._search_all_indices(query_vec, k, tag_boost, core_tags)
+                return self._search_all_indices(query_vec, k, tag_boost, core_tags, core_boost_factor)
         except Exception as exc:
             logger.error("[KnowledgeBase] Search Error: %s", exc)
             return []
 
     def _search_specific_index(
         self, diary_name: str, vector: list[float], k: int,
-        tag_boost: float, core_tags: list[str],
+        tag_boost: float, core_tags: list[str], core_boost_factor: float = 1.33,
     ) -> list[dict]:
         assert self.db is not None
         idx = self._get_or_load_diary_index(diary_name)
@@ -311,7 +392,7 @@ class KnowledgeBaseManager:
         if stats["total_vectors"] == 0:
             return []
 
-        search_vec, tag_info = self._prepare_search_vector(vector, tag_boost, core_tags)
+        search_vec, tag_info = self._prepare_search_vector(vector, tag_boost, core_tags, core_boost_factor)
         if len(search_vec) != self.config["dimension"]:
             return []
 
@@ -319,10 +400,10 @@ class KnowledgeBaseManager:
         return self._hydrate_results(results, tag_info, with_updated_at=True)
 
     def _search_all_indices(
-        self, vector: list[float], k: int, tag_boost: float, core_tags: list[str],
+        self, vector: list[float], k: int, tag_boost: float, core_tags: list[str], core_boost_factor: float = 1.33,
     ) -> list[dict]:
         assert self.db is not None
-        search_vec, tag_info = self._prepare_search_vector(vector, tag_boost, core_tags)
+        search_vec, tag_info = self._prepare_search_vector(vector, tag_boost, core_tags, core_boost_factor)
 
         all_diaries = self.db.execute("SELECT DISTINCT diary_name FROM files").fetchall()
         all_results: list[dict] = []
@@ -338,12 +419,12 @@ class KnowledgeBaseManager:
         return self._hydrate_results(top_k, tag_info, with_updated_at=False)
 
     def _prepare_search_vector(
-        self, vector: list[float], tag_boost: float, core_tags: list[str],
+        self, vector: list[float], tag_boost: float, core_tags: list[str], core_boost_factor: float = 1.33,
     ) -> tuple[np.ndarray, dict | None]:
         vec = np.array(vector, dtype=np.float32)
         tag_info: dict | None = None
         if tag_boost > 0:
-            boost = self._apply_tag_boost_v3(vec, tag_boost, core_tags)
+            boost = self._apply_tag_boost_v3(vec, tag_boost, core_tags, core_boost_factor)
             vec = boost["vector"]
             tag_info = boost["info"]
         return vec, tag_info
@@ -386,8 +467,12 @@ class KnowledgeBaseManager:
                 "sourceFile": os.path.basename(row["source_file"]),
                 "matchedTags": tag_info["matched_tags"] if tag_info else [],
                 "boostFactor": tag_info["boost_factor"] if tag_info else 0,
+                "tagMatchScore": tag_info.get("totalSpikeScore", 0) if tag_info else 0,
+                "tagMatchCount": len(tag_info["matched_tags"]) if tag_info else 0,
                 "coreTagsMatched": tag_info["core_tags_matched"] if tag_info else [],
             }
+            if with_updated_at:
+                item["fullPath"] = row["source_file"]
             if with_updated_at and "updated_at" in row:
                 item["updated_at"] = row["updated_at"]
             hydrated.append(item)
@@ -586,8 +671,9 @@ class KnowledgeBaseManager:
                 return {"vector": original, "info": None}
 
             # 融合
-            fused = ((1 - effective_tag_boost) * original.astype(np.float64)
-                     + effective_tag_boost * context_vec)
+            alpha = min(1.0, effective_tag_boost)
+            fused = ((1 - alpha) * original.astype(np.float64)
+                     + alpha * context_vec)
             fused_mag = np.linalg.norm(fused)
             if fused_mag > 1e-9:
                 fused /= fused_mag
@@ -630,9 +716,15 @@ class KnowledgeBaseManager:
             return {"vector": original, "info": None}
 
     # 公开 wrappers（供 Engine 调用）
-    def apply_tag_boost(self, vector: list[float] | np.ndarray, tag_boost: float, core_tags: list[str] | None = None) -> dict:
+    def apply_tag_boost(
+        self,
+        vector: list[float] | np.ndarray,
+        tag_boost: float,
+        core_tags: list[str] | None = None,
+        core_boost_factor: float = 1.33,
+    ) -> dict:
         vec = np.array(vector, dtype=np.float32) if not isinstance(vector, np.ndarray) else vector.astype(np.float32)
-        return self._apply_tag_boost_v3(vec, tag_boost, core_tags or [])
+        return self._apply_tag_boost_v3(vec, tag_boost, core_tags or [], core_boost_factor)
 
     def get_epa_analysis(self, vector: list[float] | np.ndarray) -> dict:
         if not self.epa or not self.epa.initialized:
@@ -736,8 +828,6 @@ class KnowledgeBaseManager:
             if not self.pending_files:
                 return
             batch_files = list(self.pending_files)[:self.config["max_batch_size"]]
-            for f in batch_files:
-                self.pending_files.discard(f)
             if self._batch_timer:
                 self._batch_timer.cancel()
                 self._batch_timer = None
@@ -790,6 +880,10 @@ class KnowledgeBaseManager:
                     logger.warning("Read error %s: %s", file_path, exc)
 
             if not docs_by_diary:
+                with self._lock:
+                    for f in batch_files:
+                        self.pending_files.discard(f)
+                        self.file_retry_count.pop(f, None)
                 self._is_processing = False
                 return
 
@@ -818,12 +912,12 @@ class KnowledgeBaseManager:
 
             embed_cfg = {"api_key": self.config["api_key"], "api_url": self.config["api_url"], "model": self.config["model"]}
 
-            chunk_vectors: list[list[float]] = []
+            chunk_vectors: list[list[float] | None] = []
             if all_chunks_meta:
                 chunk_vectors = await get_embeddings_batch([m["text"] for m in all_chunks_meta], embed_cfg)
 
             new_tags = list(new_tags_set)
-            tag_vectors: list[list[float]] = []
+            tag_vectors: list[list[float] | None] = []
             if new_tags:
                 for i in range(0, len(new_tags), 100):
                     tag_vectors.extend(await get_embeddings_batch(new_tags[i:i + 100], embed_cfg))
@@ -836,7 +930,7 @@ class KnowledgeBaseManager:
             with self.db:
                 # 插入新 Tag
                 for i, t in enumerate(new_tags):
-                    if i >= len(tag_vectors):
+                    if i >= len(tag_vectors) or tag_vectors[i] is None:
                         break
                     vec_bytes = np.array(tag_vectors[i], dtype=np.float32).tobytes()
                     self.db.execute("INSERT OR IGNORE INTO tags (name, vector) VALUES (?, ?)", (t, vec_bytes))
@@ -847,9 +941,10 @@ class KnowledgeBaseManager:
                         tag_updates.append({"id": row[0], "vec": vec_bytes})
 
                 # 关联向量到 chunks_meta
+                meta_map: dict[tuple[str, int], dict] = {}
                 for idx_i, meta in enumerate(all_chunks_meta):
-                    if idx_i < len(chunk_vectors):
-                        meta["vector"] = chunk_vectors[idx_i]
+                    meta["vector"] = chunk_vectors[idx_i] if idx_i < len(chunk_vectors) else None
+                    meta_map[(meta["doc"]["rel_path"], meta["chunk_idx"])] = meta
 
                 # 处理各 diary 的文档
                 for d_name, docs in docs_by_diary.items():
@@ -876,7 +971,7 @@ class KnowledgeBaseManager:
                             file_id = cursor.lastrowid
 
                         for ci, txt in enumerate(doc["chunks"]):
-                            meta = next((m for m in all_chunks_meta if m["doc"] is doc and m["chunk_idx"] == ci), None)
+                            meta = meta_map.get((doc["rel_path"], ci))
                             if meta and meta.get("vector"):
                                 vec_bytes = np.array(meta["vector"], dtype=np.float32).tobytes()
                                 cur = self.db.execute(
@@ -935,8 +1030,23 @@ class KnowledgeBaseManager:
             logger.info("[KnowledgeBase] Batch complete. Updated %d diary indices.", len(updates))
             self._build_cooccurrence_matrix()
 
+            with self._lock:
+                for f in batch_files:
+                    self.pending_files.discard(f)
+                    self.file_retry_count.pop(f, None)
+
         except Exception as exc:
             logger.error("[KnowledgeBase] Batch failed: %s", exc)
+            with self._lock:
+                max_file_retries = 3
+                for f in batch_files:
+                    count = self.file_retry_count.get(f, 0) + 1
+                    if count >= max_file_retries:
+                        self.pending_files.discard(f)
+                        self.file_retry_count.pop(f, None)
+                    else:
+                        self.pending_files.add(f)
+                        self.file_retry_count[f] = count
         finally:
             self._is_processing = False
             with self._lock:
@@ -1241,6 +1351,9 @@ class KnowledgeBaseManager:
         if self.watcher:
             self.watcher.stop()
             self.watcher = None
+        if self._idle_sweep_timer:
+            self._idle_sweep_timer.cancel()
+            self._idle_sweep_timer = None
         for name, timer in list(self._save_timers.items()):
             timer.cancel()
             self._save_index_to_disk(name)

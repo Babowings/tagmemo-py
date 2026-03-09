@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from tagmemo.vcp_compat import (
     VCPPlaceholderProcessor,
     extract_daily_note_payload,
     parse_tool_requests,
+    write_daily_note,
 )
 
 
@@ -77,3 +80,38 @@ async def test_placeholder_processor_replaces_rag_and_aimemo():
     assert "VCP_RAG_BLOCK_START" in content
     assert "这是我获取的所有相关知识/记忆[[" in content
     assert "[工作]" in content
+
+
+def test_write_daily_note_rewrites_local_file_urls(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    project_base = tmp_path / "project"
+    note_root = tmp_path / "data" / "dailynote"
+    local_dir = tmp_path / "local"
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    image_path = local_dir / "demo image.png"
+    image_path.write_bytes(b"fake-image")
+    doc_path = local_dir / "notes.txt"
+    doc_path.write_text("attached doc", encoding="utf-8")
+
+    monkeypatch.setenv("PROJECT_BASE_PATH", str(project_base))
+    monkeypatch.setenv("SERVER_PORT", "3100")
+    monkeypatch.setenv("VarHttpUrl", "http://127.0.0.1")
+    monkeypatch.setenv("IMAGESERVER_IMAGE_KEY", "img-key")
+    monkeypatch.setenv("IMAGESERVER_FILE_KEY", "file-key")
+
+    file_url_image = image_path.resolve().as_uri()
+    file_url_doc = doc_path.resolve().as_uri()
+    target = write_daily_note(
+        str(note_root),
+        "小克",
+        "2026-03-09",
+        f"![图]({file_url_image})\n[附件]({file_url_doc})",
+    )
+
+    body = target.read_text(encoding="utf-8")
+
+    assert "file://" not in body
+    assert "/images/dailynote/" in body
+    assert "/files/dailynote/" in body
+    assert list((project_base / "image" / "dailynote").iterdir())
+    assert list((project_base / "file" / "dailynote").iterdir())

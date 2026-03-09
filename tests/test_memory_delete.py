@@ -9,6 +9,7 @@ from tagmemo.knowledge_base import KnowledgeBaseManager
 class _DummyIndex:
     def __init__(self) -> None:
         self.removed: list[int] = []
+        self.saved_paths: list[str] = []
 
     def remove(self, key: int) -> None:
         self.removed.append(key)
@@ -17,7 +18,15 @@ class _DummyIndex:
         return None
 
     def save(self, path: str) -> None:
-        return None
+        self.saved_paths.append(path)
+
+
+class _DummyTimer:
+    def __init__(self) -> None:
+        self.cancelled = False
+
+    def cancel(self) -> None:
+        self.cancelled = True
 
 
 def _build_kb(tmp_path: Path) -> KnowledgeBaseManager:
@@ -156,3 +165,22 @@ def test_reconcile_missing_files_removes_stale_db_records(tmp_path: Path):
     remaining = kb.db.execute("SELECT path FROM files ORDER BY id").fetchall()
     assert remaining == [("DiaryA/2026-01-01.md",)]
     assert diary_idx.removed == [102]
+
+
+def test_idle_eviction_saves_and_unloads_diary_index(tmp_path: Path):
+    kb = _build_kb(tmp_path)
+
+    diary_idx = _DummyIndex()
+    save_timer = _DummyTimer()
+    kb.diary_indices["DiaryA"] = diary_idx
+    kb._save_timers["DiaryA"] = save_timer
+    kb.diary_index_last_used = {"DiaryA": 0}
+    kb.config["index_idle_ttl"] = 1
+
+    kb._evict_idle_indices(now=10)
+
+    assert "DiaryA" not in kb.diary_indices
+    assert "DiaryA" not in kb.diary_index_last_used
+    assert save_timer.cancelled is True
+    assert len(diary_idx.saved_paths) == 1
+    assert diary_idx.saved_paths[0].endswith(".usearch")
