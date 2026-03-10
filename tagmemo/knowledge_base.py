@@ -25,6 +25,7 @@ import numpy as np
 
 from .embedding_utils import get_embeddings_batch
 from .epa import EPAModule
+from .path_utils import resolve_project_path
 from .residual_pyramid import ResidualPyramid
 from .result_deduplicator import ResultDeduplicator
 from .text_chunker import chunk_text
@@ -51,11 +52,10 @@ class KnowledgeBaseManager:
 
     def __init__(self, config: dict | None = None) -> None:
         cfg = config or {}
-        base_dir = str(Path(__file__).resolve().parent.parent)
 
         self.config = {
-            "root_path":       cfg.get("root_path",       os.environ.get("KNOWLEDGEBASE_ROOT_PATH",  os.path.join(base_dir, "data", "dailynote"))),
-            "store_path":      cfg.get("store_path",      os.environ.get("KNOWLEDGEBASE_STORE_PATH", os.path.join(base_dir, "VectorStore"))),
+            "root_path":       resolve_project_path(cfg.get("root_path") or os.environ.get("KNOWLEDGEBASE_ROOT_PATH", ""), "data/dailynote"),
+            "store_path":      resolve_project_path(cfg.get("store_path") or os.environ.get("KNOWLEDGEBASE_STORE_PATH", ""), "VectorStore"),
             "api_key":         cfg.get("api_key",         os.environ.get("API_Key", "")),
             "api_url":         cfg.get("api_url",         os.environ.get("API_URL", "")),
             "model":           cfg.get("model",           os.environ.get("WhitelistEmbeddingModel", "text-embedding-3-small")),

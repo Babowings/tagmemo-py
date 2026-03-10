@@ -26,6 +26,7 @@ import numpy as np
 from .context_vector import ContextVectorManager
 from .embedding_service import EmbeddingService
 from .knowledge_base import KnowledgeBaseManager
+from .path_utils import resolve_project_path
 from .reranker import Reranker
 from .semantic_groups import SemanticGroupManager
 from .text_sanitizer import TextSanitizer
@@ -64,8 +65,14 @@ class TagMemoEngine:
             "chat_api_url": cfg.get("chat_api_url") or os.environ.get("CHAT_API_URL", ""),
             "chat_model": cfg.get("chat_model") or os.environ.get("CHAT_MODEL", "gpt-4o-mini"),
             "dimension": int(os.environ.get("VECTORDB_DIMENSION", 0)) or cfg.get("dimension", 3072),
-            "root_path": cfg.get("root_path") or os.environ.get("KNOWLEDGEBASE_ROOT_PATH", ""),
-            "store_path": cfg.get("store_path") or os.environ.get("KNOWLEDGEBASE_STORE_PATH", ""),
+            "root_path": resolve_project_path(
+                cfg.get("root_path") or os.environ.get("KNOWLEDGEBASE_ROOT_PATH", ""),
+                "data/dailynote",
+            ),
+            "store_path": resolve_project_path(
+                cfg.get("store_path") or os.environ.get("KNOWLEDGEBASE_STORE_PATH", ""),
+                "VectorStore",
+            ),
             "enable_semantic_groups": cfg.get("enable_semantic_groups", True),
             "enable_time_parsing": cfg.get("enable_time_parsing", True),
             "timezone": cfg.get("timezone") or os.environ.get("DEFAULT_TIMEZONE", "Asia/Shanghai"),
@@ -77,8 +84,12 @@ class TagMemoEngine:
                 cfg.get("query_cache_ttl")
                 or int(os.environ.get("QUERY_CACHE_TTL_MS", "3600000"))
             ) / 1000.0,  # 转为秒
-            **cfg,
         }
+
+        for key, value in cfg.items():
+            if key in {"root_path", "store_path"}:
+                continue
+            self.config[key] = value
 
         # 子系统（延迟初始化）
         self.embedding_service: EmbeddingService | None = None
