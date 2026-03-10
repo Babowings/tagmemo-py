@@ -71,7 +71,8 @@ def memory_db() -> sqlite3.Connection:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS kv_store (
             key TEXT PRIMARY KEY,
-            value TEXT
+            value TEXT,
+            vector BLOB
         )
     """)
     conn.commit()

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -298,3 +300,57 @@ async def test_flush_batch_clears_retry_count_after_success(tmp_path: Path, monk
     await kb._flush_batch()
 
     assert kb.file_retry_count.get(str(file_path)) is None
+
+
+def test_flush_batch_async_deduplicates_inflight_dispatches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    kb = _build_kb(tmp_path)
+    file_path = tmp_path / "data" / "dailynote" / "DiaryA" / "queued.md"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("hello", encoding="utf-8")
+    kb.pending_files.add(str(file_path))
+
+    started: list[str] = []
+
+    class _FakeThread:
+        def __init__(self, target=None, daemon=None):
+            self.target = target
+            self.daemon = daemon
+
+        def start(self):
+            started.append("started")
+
+    monkeypatch.setattr(threading, "Thread", _FakeThread)
+
+    kb._flush_batch_async()
+    kb._flush_batch_async()
+    kb._flush_batch_async()
+
+    assert len(started) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_embeddings_batch_logs_nonempty_failure_details(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+    async def _fake_send_batch(client, batch_texts, config, batch_number):
+        raise RuntimeError("")
+
+    monkeypatch.setattr(embedding_utils, "_MAX_BATCH_ITEMS", 2)
+    monkeypatch.setattr(embedding_utils, "_safe_max_tokens", 10)
+
+    class _FakeEncoding:
+        def encode(self, text: str) -> list[int]:
+            return [1]
+
+    monkeypatch.setattr(embedding_utils, "_encoding", _FakeEncoding())
+    monkeypatch.setattr(embedding_utils, "_send_batch", _fake_send_batch)
+
+    with caplog.at_level(logging.ERROR):
+        result = await embedding_utils.get_embeddings_batch(
+            ["a", "b", "c"],
+            {"api_key": "k", "api_url": "http://example.com", "model": "m"},
+            concurrency=1,
+        )
+
+    assert result == [None, None, None]
+    error_messages = [record.getMessage() for record in caplog.records if "failed permanently" in record.getMessage()]
+    assert error_messages
+    assert all(not message.endswith(": ") for message in error_messages)

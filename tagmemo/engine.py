@@ -23,9 +23,11 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 
+from .ai_memo import AIMemoHandler
 from .context_vector import ContextVectorManager
 from .embedding_service import EmbeddingService
 from .knowledge_base import KnowledgeBaseManager
+from .meta_thinking import MetaThinkingManager
 from .path_utils import resolve_project_path
 from .reranker import Reranker
 from .semantic_groups import SemanticGroupManager
@@ -105,10 +107,19 @@ class TagMemoEngine:
         self.query_cache: dict[str, dict] = {}
         self.cache_stats: dict[str, int] = {"hits": 0, "misses": 0}
         self._cache_cleanup_task: asyncio.Task | None = None
+        self._ai_memo_cache_cleanup_task: asyncio.Task | None = None
+        self.enhanced_vector_cache: dict[str, list[float]] = {}
+        self.ai_memo_cache: dict[str, dict] = {}
+        self.ai_memo_cache_max_size = int(os.environ.get("AIMEMO_CACHE_MAX_SIZE", "50") or 50)
+        self.ai_memo_cache_ttl = int(os.environ.get("AIMEMO_CACHE_TTL_MS", "1800000") or 1800000)
+        self.push_vcp_info = cfg.get("push_vcp_info")
 
         # RAG 参数（从 KnowledgeBaseManager 共享 + 本地热加载）
         self.rag_params: dict = {}
         self._rag_params_watcher_task: asyncio.Task | None = None
+
+        self.ai_memo_handler: AIMemoHandler | None = None
+        self.meta_thinking_manager: MetaThinkingManager | None = None
 
         self.initialized = False
 
@@ -142,6 +153,7 @@ class TagMemoEngine:
         })
         await self.knowledge_base.initialize()
         self.rag_params = self.knowledge_base.rag_params
+        await self._build_and_save_cache()
 
         # 3. Context Vector Manager
         self.context_vector_manager = ContextVectorManager(
@@ -156,6 +168,11 @@ class TagMemoEngine:
             )
             await self.semantic_group_manager.initialize()
 
+        self.ai_memo_handler = AIMemoHandler(self, self.ai_memo_cache)
+        await self.ai_memo_handler.load_config()
+        self.meta_thinking_manager = MetaThinkingManager(self)
+        await self.meta_thinking_manager.load_config()
+
         # 5. Time Expression Parser（可选）
         if self.config["enable_time_parsing"]:
             self.time_parser = TimeExpressionParser()
@@ -166,6 +183,7 @@ class TagMemoEngine:
 
         # 7. 启动缓存定期清理（每 10 分钟）
         self._cache_cleanup_task = asyncio.create_task(self._periodic_cache_cleanup())
+        self._ai_memo_cache_cleanup_task = asyncio.create_task(self._periodic_ai_memo_cache_cleanup())
 
         self.initialized = True
         logger.info(
@@ -208,6 +226,7 @@ class TagMemoEngine:
             # 1. 更新上下文向量映射
             messages = self._build_messages_array(user_message, history)
             await self.context_vector_manager.update_context(messages, allow_api=True)
+            context_diary_prefixes = self._extract_context_diary_prefixes(messages)
 
             # 2. 清洗文本
             clean_user = TextSanitizer.sanitize(user_message)
@@ -296,6 +315,7 @@ class TagMemoEngine:
                     core_tags=core_tags_for_search,
                     time_ranges=time_ranges,
                     use_rerank=use_rerank,
+                    context_diary_prefixes=context_diary_prefixes,
                 )
             else:
                 results, search_meta = await self._shotgun_query(
@@ -306,6 +326,7 @@ class TagMemoEngine:
                     tag_weight=dynamic_params["tag_weight"],
                     core_tags=core_tags_for_search,
                     use_rerank=use_rerank,
+                    context_diary_prefixes=context_diary_prefixes,
                 )
 
             # 11. 格式化记忆上下文
@@ -382,13 +403,24 @@ class TagMemoEngine:
             elif unique_tokens > 40:
                 k_base = max(k_base, 4)
 
+        analysis_vector = query_vector
+        if self.context_vector_manager is not None:
+            context_vectors = [query_vector]
+            assistant_context = self.context_vector_manager.aggregate_context("assistant")
+            user_context = self.context_vector_manager.aggregate_context("user")
+            if assistant_context:
+                context_vectors.append(assistant_context)
+            if user_context:
+                context_vectors.append(user_context)
+            analysis_vector = self._average_vectors(context_vectors)
+
         # EPA 分析
-        epa = self.knowledge_base.get_epa_analysis(query_vector)
+        epa = self.knowledge_base.get_epa_analysis(analysis_vector)
         logic_depth = epa.get("logicDepth", 0.5)
         resonance = epa.get("resonance", 0)
 
         # 语义宽度
-        semantic_width = ContextVectorManager.compute_semantic_width(query_vector)
+        semantic_width = ContextVectorManager.compute_semantic_width(analysis_vector)
 
         # 动态 Beta (TagWeight)
         cfg = (
@@ -468,6 +500,7 @@ class TagMemoEngine:
         tag_weight: float,
         core_tags: list[str],
         use_rerank: bool,
+        context_diary_prefixes: set[str] | None = None,
     ) -> tuple[list[dict], dict]:
         """Shotgun Query: 多向量并行搜索 + SVD 去重 + 可选 Rerank。"""
         do_rerank = use_rerank and self.reranker.enabled
@@ -475,10 +508,25 @@ class TagMemoEngine:
 
         # 构建搜索向量数组
         search_vectors: list[dict] = [{"vector": query_vector, "type": "current"}]
-        if history_segments:
+        seen_vectors = {tuple(round(float(v), 6) for v in query_vector)}
+
+        def _append_vector(vector: list[float], label: str) -> None:
+            key = tuple(round(float(v), 6) for v in vector)
+            if key in seen_vectors:
+                return
+            seen_vectors.add(key)
+            search_vectors.append({"vector": vector, "type": label})
+
+        if self.context_vector_manager is not None:
+            for idx, vector in enumerate(self.context_vector_manager.get_history_assistant_vectors()[-2:]):
+                _append_vector(vector, f"assistant_{idx}")
+            for idx, vector in enumerate(self.context_vector_manager.get_history_user_vectors()[-1:]):
+                _append_vector(vector, f"user_{idx}")
+
+        if len(search_vectors) == 1 and history_segments:
             recent = history_segments[-3:]
             for i, seg in enumerate(recent):
-                search_vectors.append({"vector": seg["vector"], "type": f"history_{i}"})
+                _append_vector(seg["vector"], f"history_{i}")
 
         logger.info(
             "[TagMemoEngine] Shotgun Query: %d parallel searches (K=%d%s)",
@@ -518,7 +566,8 @@ class TagMemoEngine:
         else:
             final_results = unique_results[:k]
 
-        tagged_results = [{**r, "source": "rag"} for r in final_results]
+        filtered_results = self._filter_context_duplicates(final_results, context_diary_prefixes or set())
+        tagged_results = [{**r, "source": "rag"} for r in filtered_results]
 
         search_meta = {
             "vector_count": len(search_vectors),
@@ -543,6 +592,7 @@ class TagMemoEngine:
         core_tags: list[str],
         time_ranges: list[dict],
         use_rerank: bool,
+        context_diary_prefixes: set[str] | None = None,
     ) -> tuple[list[dict], dict]:
         """时间感知检索: 语义搜索 + 时间范围扫描，合并去重。"""
 
@@ -555,10 +605,30 @@ class TagMemoEngine:
             tag_weight=tag_weight,
             core_tags=core_tags,
             use_rerank=use_rerank,
+            context_diary_prefixes=context_diary_prefixes,
         )
 
         # 2. 时间范围检索
         time_results = await self._get_time_range_diaries(diary_name, time_ranges)
+        if time_results and self.knowledge_base:
+            file_paths = [entry.get("fullPath") for entry in time_results if entry.get("fullPath")]
+            chunk_rows = self.knowledge_base.get_chunks_by_file_paths([str(path) for path in file_paths])
+            if chunk_rows:
+                similarity_by_path: dict[str, float] = {}
+                for row in chunk_rows:
+                    vector = row.get("vector")
+                    source_file = row.get("sourceFile")
+                    if not vector or not source_file:
+                        continue
+                    similarity = self._cosine_similarity(query_vector, vector)
+                    similarity_by_path[str(source_file)] = max(
+                        similarity,
+                        similarity_by_path.get(str(source_file), 0.0),
+                    )
+                time_results.sort(
+                    key=lambda entry: similarity_by_path.get(str(entry.get("fullPath") or ""), 0.0),
+                    reverse=True,
+                )
 
         # 3. 合并去重（以文本内容前 200 字符去重）
         all_entries: dict[str, dict] = {}
@@ -571,7 +641,7 @@ class TagMemoEngine:
             if key and key not in all_entries:
                 all_entries[key] = entry
 
-        merged = list(all_entries.values())
+        merged = self._filter_context_duplicates(list(all_entries.values()), context_diary_prefixes or set())
         logger.info(
             "[TagMemoEngine] TimeAware: %d semantic + %d temporal = %d unique",
             len(rag_results),
@@ -644,6 +714,7 @@ class TagMemoEngine:
                                     "date": date_str,
                                     "text": content[:2000],
                                     "sourceFile": fname,
+                                    "fullPath": os.path.join(os.path.basename(dir_path), fname).replace("\\", "/"),
                                     "source": "time",
                                 })
                                 break  # 一个文件只加一次
@@ -807,6 +878,31 @@ class TagMemoEngine:
                 len(self.query_cache),
             )
 
+    async def _periodic_ai_memo_cache_cleanup(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(600)
+                self._evict_expired_ai_memo_cache()
+        except asyncio.CancelledError:
+            pass
+
+    def _evict_expired_ai_memo_cache(self) -> None:
+        if not self.ai_memo_cache:
+            return
+        now_ms = datetime.now().timestamp() * 1000
+        expired = [
+            key for key, value in self.ai_memo_cache.items()
+            if now_ms - float(value.get("timestamp") or 0) > self.ai_memo_cache_ttl
+        ]
+        for key in expired:
+            self.ai_memo_cache.pop(key, None)
+        if expired:
+            logger.info(
+                "[TagMemoEngine] AIMemo cache eviction: removed %d expired, %d remaining",
+                len(expired),
+                len(self.ai_memo_cache),
+            )
+
     def clear_cache(self) -> None:
         """清空查询缓存。"""
         self.query_cache.clear()
@@ -893,6 +989,7 @@ class TagMemoEngine:
                         # 同步到 KnowledgeBaseManager
                         if self.knowledge_base:
                             self.knowledge_base.rag_params = self.rag_params
+                        await self._build_and_save_cache()
                         # 参数变更清空缓存
                         self.clear_cache()
                         logger.info("[TagMemoEngine] RAG params reloaded")
@@ -914,6 +1011,7 @@ class TagMemoEngine:
             self.rag_params = json.load(f)
         if self.knowledge_base:
             self.knowledge_base.rag_params = self.rag_params
+        await self._build_and_save_cache()
         self.clear_cache()
         logger.info("[TagMemoEngine] RAG params manually reloaded")
 
@@ -947,6 +1045,149 @@ class TagMemoEngine:
                     return text_part or None
         return None
 
+    async def _build_and_save_cache(self, cache_path: Path | None = None) -> None:
+        if self.embedding_service is None:
+            return
+
+        diary_configs = self._load_diary_tag_configs()
+        if not diary_configs:
+            self.enhanced_vector_cache = {}
+            return
+
+        target_path = cache_path or (Path(self.config["store_path"]) / "enhanced_vector_cache.json")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        vectors: dict[str, list[float]] = {}
+        for diary_name, config in diary_configs.items():
+            tags = config.get("tags") if isinstance(config, dict) else None
+            if not isinstance(tags, list) or not tags:
+                continue
+
+            weighted_tags: list[str] = []
+            for raw_tag in tags:
+                tag_name = str(raw_tag).strip()
+                weight = 1
+                if ":" in tag_name:
+                    name_part, weight_part = tag_name.rsplit(":", 1)
+                    tag_name = name_part.strip()
+                    try:
+                        weight = max(1, round(float(weight_part)))
+                    except ValueError:
+                        weight = 1
+                if tag_name:
+                    weighted_tags.extend([tag_name] * weight)
+
+            if not weighted_tags:
+                continue
+
+            vector = await self.embedding_service.embed(
+                f"{diary_name} 的相关主题：{', '.join(weighted_tags)}"
+            )
+            if vector:
+                vectors[diary_name] = vector
+
+        self.enhanced_vector_cache = vectors
+        source_hash = hashlib.sha256(
+            json.dumps(diary_configs, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        target_path.write_text(
+            json.dumps(
+                {
+                    "sourceHash": source_hash,
+                    "vectors": self.enhanced_vector_cache,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    def _load_diary_tag_configs(self) -> dict[str, dict]:
+        rag_config = self.rag_params.get("RAGDiaryPlugin") or {}
+        for key in ("diary_tags", "diaries", "ragConfig"):
+            value = rag_config.get(key)
+            if isinstance(value, dict):
+                return value
+        return {
+            key: value
+            for key, value in rag_config.items()
+            if isinstance(value, dict) and isinstance(value.get("tags"), list)
+        }
+
+    def get_enhanced_diary_vector(self, diary_name: str) -> list[float] | None:
+        return self.enhanced_vector_cache.get(diary_name)
+
+    @staticmethod
+    def _average_vectors(vectors: list[list[float]]) -> list[float]:
+        return np.mean(np.asarray(vectors, dtype=np.float32), axis=0).astype(np.float32).tolist()
+
+    @staticmethod
+    def _cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
+        a = np.asarray(vec_a, dtype=np.float32)
+        b = np.asarray(vec_b, dtype=np.float32)
+        norm_a = float(np.linalg.norm(a))
+        norm_b = float(np.linalg.norm(b))
+        if norm_a <= 1e-9 or norm_b <= 1e-9:
+            return 0.0
+        return float(np.dot(a, b) / (norm_a * norm_b))
+
+    def _extract_context_diary_prefixes(self, messages: list[dict]) -> set[str]:
+        prefixes: set[str] = set()
+        block_re = re.compile(r"<<<\[?TOOL_REQUEST\]?>>>([\s\S]*?)<<<\[?END_TOOL_REQUEST\]?>>>", re.I)
+        field_re = re.compile(r"(\w+)\s*:\s*[「『]始[」』]([\s\S]*?)[「『]末[」』]", re.I)
+
+        for message in messages:
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = next((part.get("text", "") for part in content if part.get("type") == "text"), "")
+            if not isinstance(content, str) or "TOOL_REQUEST" not in content:
+                continue
+
+            for block in block_re.findall(content):
+                fields = {key.lower(): value.strip() for key, value in field_re.findall(block)}
+                if fields.get("tool_name", "").lower() != "dailynote":
+                    continue
+                if fields.get("command", "").lower() != "create":
+                    continue
+                body = fields.get("content", "").strip().strip("「」『』\"'")
+                if body:
+                    prefixes.add(body[:80].strip())
+
+        return prefixes
+
+    def _filter_context_duplicates(self, results: list[dict], prefixes: set[str]) -> list[dict]:
+        if not results or not prefixes:
+            return results
+
+        filtered: list[dict] = []
+        for result in results:
+            text = str(result.get("text") or "").strip()
+            if not text:
+                filtered.append(result)
+                continue
+            body = re.sub(r"^\[\d{4}-\d{2}-\d{2}\]\s*-\s*.*?\n", "", text).strip()
+            prefix = body[:80].strip()
+            if not prefix:
+                filtered.append(result)
+                continue
+
+            duplicate = False
+            for context_prefix in prefixes:
+                common_length = 0
+                for left_char, right_char in zip(prefix, context_prefix):
+                    if left_char != right_char:
+                        break
+                    common_length += 1
+                if common_length > 10:
+                    duplicate = True
+                    break
+            if not duplicate:
+                filtered.append(result)
+
+        return filtered
+
     # =================================================================
     # Lifecycle
     # =================================================================
@@ -963,6 +1204,14 @@ class TagMemoEngine:
             except asyncio.CancelledError:
                 pass
             self._cache_cleanup_task = None
+
+        if self._ai_memo_cache_cleanup_task:
+            self._ai_memo_cache_cleanup_task.cancel()
+            try:
+                await self._ai_memo_cache_cleanup_task
+            except asyncio.CancelledError:
+                pass
+            self._ai_memo_cache_cleanup_task = None
 
         # 取消 rag_params watcher
         if self._rag_params_watcher_task:

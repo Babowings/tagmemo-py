@@ -8,11 +8,13 @@
     :root { color-scheme: dark; }
     * { box-sizing: border-box; }
     body { margin: 0; font-family: "Segoe UI", system-ui, sans-serif; background:#0f1115; color:#e8e8e8; }
-    .wrap { max-width: 960px; margin: 0 auto; min-height: 100vh; display:flex; flex-direction:column; }
+    .wrap { max-width: 1500px; margin: 0 auto; min-height: 100vh; display:flex; flex-direction:column; }
     .top { padding: 14px; border-bottom:1px solid #242c3a; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
     .top input, .top select, .top button { background:#131a27; color:#e8e8e8; border:1px solid #2c3546; border-radius:8px; padding:8px 10px; }
     .top .grow { flex:1; min-width: 220px; }
-    #messages { flex:1; padding:16px; overflow:auto; display:flex; flex-direction:column; gap:10px; }
+    .main { flex:1; min-height:0; display:grid; grid-template-columns: minmax(0, 1.7fr) minmax(340px, 0.9fr); }
+    .chatPane { min-height:0; display:flex; flex-direction:column; border-right:1px solid #242c3a; }
+    #messages { flex:1; min-height:0; padding:16px; overflow:auto; display:flex; flex-direction:column; gap:10px; }
     .msg { border:1px solid #2a3140; border-radius:10px; padding:10px 12px; white-space:pre-wrap; line-height:1.45; }
     .user { background:#1a2540; border-color:#3d5ea8; align-self:flex-end; max-width:85%; }
     .assistant { background:#151b28; align-self:flex-start; max-width:92%; }
@@ -22,6 +24,26 @@
     .actions { display:flex; flex-direction:column; gap:8px; }
     .actions button { background:#1b2845; color:#dfe8ff; border:1px solid #4167b5; border-radius:8px; padding:10px 12px; cursor:pointer; }
     .hint { font-size:12px; color:#9aa6c2; margin-top:4px; }
+    .eventsPane { min-height:0; display:flex; flex-direction:column; background:#10151f; }
+    .eventsHead { padding:14px 16px; border-bottom:1px solid #242c3a; display:flex; flex-direction:column; gap:8px; }
+    .eventsTitle { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+    .eventsTitle strong { font-size:14px; }
+    .statusBadge { font-size:12px; padding:4px 8px; border-radius:999px; border:1px solid #38507f; color:#cdddff; background:#16223a; }
+    .statusBadge.idle { border-color:#3a424f; color:#b6bece; background:#171c25; }
+    .statusBadge.done { border-color:#2f6b46; color:#d4ffe3; background:#163022; }
+    .statusBadge.error { border-color:#84404d; color:#ffd8df; background:#381820; }
+    .metaLine { font-size:12px; color:#98a4bd; word-break:break-all; }
+    #events { flex:1; min-height:0; overflow:auto; padding:14px 16px; display:flex; flex-direction:column; gap:10px; }
+    .evt { border:1px solid #273143; border-radius:10px; background:#131a27; padding:10px 12px; }
+    .evtHead { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin-bottom:6px; }
+    .evtType { font-size:12px; font-weight:700; color:#d7e4ff; letter-spacing:0.02em; }
+    .evtSeq { font-size:11px; color:#8091ae; }
+    .evtPayload { margin:0; font-size:12px; line-height:1.45; white-space:pre-wrap; color:#b4c2dd; }
+    @media (max-width: 980px) {
+      .main { grid-template-columns: 1fr; }
+      .chatPane { border-right:none; border-bottom:1px solid #242c3a; }
+      .eventsPane { min-height:280px; }
+    }
   </style>
 </head>
 <body>
@@ -38,17 +60,33 @@
     <button id="clearBtn">清空</button>
   </div>
 
-  <div id="messages"></div>
+  <div class="main">
+    <div class="chatPane">
+      <div id="messages"></div>
 
-  <div class="bottom">
-    <div>
-      <textarea id="input" placeholder="输入消息，回车发送（Shift+Enter 换行）"></textarea>
-      <div class="hint">前端会把完整历史 messages 发送给后端。</div>
+      <div class="bottom">
+        <div>
+          <textarea id="input" placeholder="输入消息，回车发送（Shift+Enter 换行）"></textarea>
+          <div class="hint">前端会把完整历史 messages 发送给后端。</div>
+        </div>
+        <div class="actions">
+          <button id="sendBtn">发送</button>
+        </div>
+      </div>
     </div>
-    <div class="actions">
-      <button id="sendBtn">发送</button>
-    </div>
+
+    <aside class="eventsPane">
+      <div class="eventsHead">
+        <div class="eventsTitle">
+          <strong>实时事件</strong>
+          <span id="eventStatus" class="statusBadge idle">空闲</span>
+        </div>
+        <div id="requestMeta" class="metaLine">尚未发送请求。</div>
+      </div>
+      <div id="events"></div>
+    </aside>
   </div>
+    </div>
 </div>
 
 <script src="/chat/static/app.js"></script>

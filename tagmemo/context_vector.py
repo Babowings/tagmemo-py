@@ -289,3 +289,33 @@ class ContextVectorManager:
     def cleanup(self, max_size: int = 1000) -> None:
         if len(self.vector_map) > max_size:
             self.vector_map.clear()
+
+    def get_history_assistant_vectors(self) -> list[list[float]]:
+        return list(self.history_assistant_vectors)
+
+    def get_history_user_vectors(self) -> list[list[float]]:
+        return list(self.history_user_vectors)
+
+    def aggregate_context(self, role: str = "assistant") -> list[float] | None:
+        vectors = self.history_assistant_vectors if role == "assistant" else self.history_user_vectors
+        if not vectors:
+            return None
+
+        if len(vectors) > self.max_context_window:
+            vectors = vectors[-self.max_context_window:]
+
+        dim = len(vectors[0])
+        aggregated = np.zeros(dim, dtype=np.float32)
+        total_weight = 0.0
+
+        for idx, vector in enumerate(vectors):
+            age = len(vectors) - idx
+            weight = float(self.decay_rate ** age)
+            aggregated += np.asarray(vector, dtype=np.float32) * weight
+            total_weight += weight
+
+        if total_weight <= 1e-9:
+            return None
+
+        aggregated /= total_weight
+        return aggregated.tolist()

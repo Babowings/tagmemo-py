@@ -1,6 +1,10 @@
 const state = {
   messages: [],
   sending: false,
+  activeRequestId: null,
+  eventStatus: 'idle',
+  events: [],
+  eventSource: null,
 };
 
 const el = {
@@ -12,6 +16,9 @@ const el = {
   messages: document.getElementById('messages'),
   input: document.getElementById('input'),
   sendBtn: document.getElementById('sendBtn'),
+  events: document.getElementById('events'),
+  eventStatus: document.getElementById('eventStatus'),
+  requestMeta: document.getElementById('requestMeta'),
 };
 
 function pushMessage(role, content) {
@@ -35,6 +42,133 @@ function render() {
     el.messages.appendChild(div);
   }
   el.messages.scrollTop = el.messages.scrollHeight;
+}
+
+function renderEvents() {
+  el.events.innerHTML = '';
+
+  if (!state.events.length) {
+    const empty = document.createElement('div');
+    empty.className = 'evt';
+    empty.textContent = '当前请求还没有收到结构化运行事件。';
+    el.events.appendChild(empty);
+  } else {
+    for (const event of state.events) {
+      const card = document.createElement('div');
+      card.className = 'evt';
+
+      const head = document.createElement('div');
+      head.className = 'evtHead';
+
+      const type = document.createElement('div');
+      type.className = 'evtType';
+      type.textContent = event.event_type || 'UNKNOWN_EVENT';
+
+      const seq = document.createElement('div');
+      seq.className = 'evtSeq';
+      seq.textContent = `#${event.seq || '?'} ${formatEventTime(event.timestamp)}`;
+
+      const payload = document.createElement('pre');
+      payload.className = 'evtPayload';
+      payload.textContent = formatEventPayload(event.payload || {});
+
+      head.appendChild(type);
+      head.appendChild(seq);
+      card.appendChild(head);
+      card.appendChild(payload);
+      el.events.appendChild(card);
+    }
+  }
+
+  el.eventStatus.textContent = getEventStatusLabel();
+  el.eventStatus.className = `statusBadge ${state.eventStatus}`;
+  el.requestMeta.textContent = state.activeRequestId
+    ? `request_id: ${state.activeRequestId}`
+    : '尚未发送请求。';
+  el.events.scrollTop = el.events.scrollHeight;
+}
+
+function getEventStatusLabel() {
+  if (state.eventStatus === 'running') return '进行中';
+  if (state.eventStatus === 'done') return '已完成';
+  if (state.eventStatus === 'error') return '错误';
+  return '空闲';
+}
+
+function formatEventTime(ts) {
+  if (!ts) return '--:--:--';
+  const date = new Date(ts * 1000);
+  return date.toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function formatEventPayload(payload) {
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch {
+    return String(payload || '');
+  }
+}
+
+function buildRequestId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return globalThis.crypto.randomUUID();
+  }
+  return `req-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function closeEventStream() {
+  if (state.eventSource) {
+    state.eventSource.close();
+    state.eventSource = null;
+  }
+}
+
+function hasTerminalEvent() {
+  return state.events.some(event => event.event_type === 'REQUEST_END');
+}
+
+function beginRequestEvents(requestId) {
+  closeEventStream();
+  state.activeRequestId = requestId;
+  state.eventStatus = 'running';
+  state.events = [];
+  renderEvents();
+
+  const base = (el.baseUrl.value || '').trim().replace(/\/$/, '');
+  const url = `${base}/v1/chat/events?request_id=${encodeURIComponent(requestId)}`;
+  const source = new EventSource(url);
+  state.eventSource = source;
+
+  source.onmessage = (event) => {
+    if (!event.data) return;
+    try {
+      const payload = JSON.parse(event.data);
+      state.events.push(payload);
+      if (payload.event_type === 'REQUEST_END') {
+        state.eventStatus = payload.payload?.status === 'error' ? 'error' : 'done';
+        closeEventStream();
+      }
+      renderEvents();
+    } catch {
+      // ignore malformed event payloads
+    }
+  };
+
+  source.onerror = () => {
+    if (hasTerminalEvent()) {
+      if (state.eventStatus === 'running') {
+        state.eventStatus = 'done';
+      }
+      closeEventStream();
+      renderEvents();
+      return;
+    }
+
+    if (state.eventStatus === 'running') {
+      state.eventStatus = 'error';
+      renderEvents();
+    }
+  };
 }
 
 function setSending(flag) {
@@ -134,10 +268,13 @@ async function onSend() {
   const base = (el.baseUrl.value || '').trim().replace(/\/$/, '');
   const endpoint = el.endpoint.value;
   const url = `${base}${endpoint}`;
+  const requestId = buildRequestId();
 
   try {
     setSending(true);
     const body = buildRequestBody();
+    body.request_id = requestId;
+    beginRequestEvents(requestId);
 
     if (el.stream.checked) {
       await sendStream(url, body, assistantIndex);
@@ -149,6 +286,8 @@ async function onSend() {
       updateMessage(assistantIndex, '(空响应)');
     }
   } catch (err) {
+    state.eventStatus = 'error';
+    renderEvents();
     updateMessage(assistantIndex, `请求失败：${err.message || err}`);
   } finally {
     setSending(false);
@@ -159,6 +298,11 @@ async function onSend() {
 el.sendBtn.addEventListener('click', onSend);
 el.clearBtn.addEventListener('click', () => {
   state.messages = [];
+  state.events = [];
+  state.activeRequestId = null;
+  state.eventStatus = 'idle';
+  closeEventStream();
+  renderEvents();
   render();
 });
 el.input.addEventListener('keydown', (e) => {
@@ -169,3 +313,4 @@ el.input.addEventListener('keydown', (e) => {
 });
 
 appendSystem('聊天前端已就绪。');
+renderEvents();

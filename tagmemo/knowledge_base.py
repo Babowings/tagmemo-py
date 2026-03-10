@@ -20,6 +20,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from typing import Awaitable, Callable
 
 import numpy as np
 
@@ -471,6 +472,8 @@ class KnowledgeBaseManager:
                 "tagMatchCount": len(tag_info["matched_tags"]) if tag_info else 0,
                 "coreTagsMatched": tag_info["core_tags_matched"] if tag_info else [],
             }
+            if r.get("vector") is not None:
+                item["vector"] = r["vector"]
             if with_updated_at:
                 item["fullPath"] = row["source_file"]
             if with_updated_at and "updated_at" in row:
@@ -747,6 +750,103 @@ class KnowledgeBaseManager:
     def get_diary_name_vector(self, diary_name: str) -> list[float] | None:
         return self.diary_name_vector_cache.get(diary_name)
 
+    def get_vector_by_text(self, diary_name: str, text: str) -> list[float] | None:
+        if self.db is None or not diary_name or not text:
+            return None
+        row = self.db.execute(
+            """
+            SELECT c.vector
+            FROM chunks c
+            JOIN files f ON c.file_id = f.id
+            WHERE f.diary_name = ? AND c.content = ?
+            LIMIT 1
+            """,
+            (diary_name, text),
+        ).fetchone()
+        if not row or not row[0]:
+            return None
+        return np.frombuffer(row[0], dtype=np.float32).copy().tolist()
+
+    async def get_plugin_description_vector(
+        self,
+        desc_text: str,
+        get_embedding_fn: Callable[[str], Awaitable[list[float] | None]] | None,
+    ) -> list[float] | None:
+        if self.db is None or not desc_text:
+            return None
+
+        key = f"plugin_desc_hash:{hashlib.sha256(desc_text.encode('utf-8')).hexdigest()}"
+        expected_bytes = int(self.config.get("dimension", 0) or 0) * 4
+
+        try:
+            row = self.db.execute(
+                "SELECT vector FROM kv_store WHERE key = ?",
+                (key,),
+            ).fetchone()
+            if row and row[0] and expected_bytes and len(row[0]) == expected_bytes:
+                return np.frombuffer(row[0], dtype=np.float32).copy().tolist()
+        except Exception as exc:
+            logger.warning("[KnowledgeBase] Plugin description cache read failed: %s", exc)
+
+        if not callable(get_embedding_fn):
+            return None
+
+        try:
+            vec = await get_embedding_fn(desc_text)
+            if not vec:
+                return None
+            self.db.execute(
+                "INSERT OR REPLACE INTO kv_store (key, vector) VALUES (?, ?)",
+                (key, np.array(vec, dtype=np.float32).tobytes()),
+            )
+            self.db.commit()
+            return vec
+        except Exception as exc:
+            logger.warning("[KnowledgeBase] Plugin description cache write failed: %s", exc)
+            return None
+
+    def get_chunks_by_file_paths(self, file_paths: list[str]) -> list[dict]:
+        if self.db is None or not file_paths:
+            return []
+
+        normalized_paths = [self._normalize_rel_path(path) for path in file_paths if path]
+        normalized_paths = list(dict.fromkeys(normalized_paths))
+        if not normalized_paths:
+            return []
+
+        batch_size = 500
+        dim = int(self.config.get("dimension", 0) or 0)
+        expected_bytes = dim * 4 if dim > 0 else 0
+        all_rows: list[dict] = []
+
+        for start in range(0, len(normalized_paths), batch_size):
+            batch = normalized_paths[start:start + batch_size]
+            placeholders = self._make_placeholders(len(batch))
+            rows = self.db.execute(
+                f"""
+                SELECT c.id, c.content, c.vector, f.path
+                FROM chunks c
+                JOIN files f ON c.file_id = f.id
+                WHERE f.path IN ({placeholders})
+                ORDER BY f.path, c.chunk_index
+                """,
+                tuple(batch),
+            ).fetchall()
+            for chunk_id, content, vector_blob, path in rows:
+                vector = None
+                if vector_blob and expected_bytes and len(vector_blob) == expected_bytes:
+                    vector = np.frombuffer(vector_blob, dtype=np.float32).copy().tolist()
+                all_rows.append(
+                    {
+                        "id": int(chunk_id),
+                        "text": str(content),
+                        "vector": vector,
+                        "sourceFile": str(path),
+                    }
+                )
+
+        return all_rows
+
     # =================================================================
     # File Watching & Ingestion
     # =================================================================
@@ -831,7 +931,6 @@ class KnowledgeBaseManager:
             if self._batch_timer:
                 self._batch_timer.cancel()
                 self._batch_timer = None
-
         self._is_processing = True
         logger.info("[KnowledgeBase] Processing %d files...", len(batch_files))
 
