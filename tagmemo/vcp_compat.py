@@ -171,6 +171,35 @@ def _rewrite_local_file_urls(content_text: str) -> str:
     return result
 
 
+def _strip_nested_placeholders(text: str) -> str:
+    if not text:
+        return text
+    text = re.sub(r"\[\[.*?日记本.*?\]\]", "[循环占位符已移除]", text)
+    text = re.sub(r"<<.*?日记本>>", "[循环占位符已移除]", text)
+    text = re.sub(r"《《.*?日记本.*?》》", "[循环占位符已移除]", text)
+    text = re.sub(r"\{\{.*?日记本\}\}", "[循环占位符已移除]", text)
+    return text
+
+
+def _read_full_diary(root_path: str, diary_name: str) -> str:
+    root = Path(root_path)
+    folder = root / diary_name
+    if not folder.exists() or not folder.is_dir():
+        return ""
+
+    chunks: list[str] = []
+    files = sorted(
+        [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in {".md", ".txt"}],
+        key=lambda x: x.as_posix(),
+    )
+    for fp in files:
+        try:
+            chunks.append(fp.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+    return _strip_nested_placeholders("\n\n".join(chunks))
+
+
 def replace_variable_placeholders(text: str, root_path: str) -> str:
     if not text:
         return text
@@ -201,7 +230,7 @@ def replace_variable_placeholders(text: str, root_path: str) -> str:
                     chunks.append(fp.read_text(encoding="utf-8", errors="replace"))
                 except Exception:
                     continue
-            replacement = "\n\n".join(chunks)
+            replacement = _strip_nested_placeholders("\n\n".join(chunks))
         out = out.replace(m.group(0), replacement)
 
     return out
@@ -320,6 +349,7 @@ class VCPPlaceholderProcessor:
         output = content
 
         rag_declarations = list(re.finditer(r"\[\[(.*?)日记本(.*?)\]\]", output))
+        fulltext_declarations = list(re.finditer(r"<<(.*?)日记本>>", output))
         hybrid_declarations = list(re.finditer(r"《《(.*?)日记本(.*?)》》", output))
 
         for declaration in rag_declarations:
@@ -334,6 +364,16 @@ class VCPPlaceholderProcessor:
                 ai_content=ai_content,
                 aimemo_licensed=aimemo_licensed,
                 threshold_gate=False,
+            )
+            output = output.replace(placeholder, resolved)
+
+        for declaration in fulltext_declarations:
+            placeholder = declaration.group(0)
+            diary_name = declaration.group(1).strip()
+            resolved = await self._resolve_fulltext_placeholder(
+                diary_name=diary_name,
+                user_content=user_content,
+                ai_content=ai_content,
             )
             output = output.replace(placeholder, resolved)
 
@@ -353,6 +393,34 @@ class VCPPlaceholderProcessor:
             output = output.replace(placeholder, resolved)
 
         return output
+
+    async def _resolve_fulltext_placeholder(
+        self,
+        *,
+        diary_name: str,
+        user_content: str,
+        ai_content: str,
+    ) -> str:
+        root_path = ((getattr(self.engine, "knowledge_base", None) or {}).config["root_path"]
+                     if getattr(getattr(self.engine, "knowledge_base", None), "config", None)
+                     else "")
+        if not root_path or not diary_name:
+            return ""
+
+        query_text = f"[AI]: {ai_content}\n[User]: {user_content}" if ai_content else user_content
+        query_vector = await self.engine.embedding_service.embed(query_text)
+        if not query_vector:
+            return ""
+
+        diary_vec = self.engine.knowledge_base.get_diary_name_vector(diary_name)
+        if not diary_vec:
+            return ""
+
+        similarity = _cosine_similarity(query_vector, diary_vec)
+        if similarity < self.threshold:
+            return ""
+
+        return _read_full_diary(root_path, diary_name)
 
     async def _resolve_placeholder(
         self,
