@@ -20,24 +20,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import uuid
 import json
 import logging
-from contextvars import ContextVar
-from logging.handlers import RotatingFileHandler
 import os
 import sqlite3
 import sys
 import time
 import traceback
+import uuid
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import httpx
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -46,8 +46,8 @@ from tagmemo.audit_logger import AuditLogger
 from tagmemo.engine import TagMemoEngine
 from tagmemo.runtime_events import RuntimeEventHub
 from tagmemo.vcp_compat import (
-    _strip_system_notification,
     VCPPlaceholderProcessor,
+    _strip_system_notification,
     build_tool_payload_for_rag,
     extract_ai_text_from_response_payload,
     extract_daily_note_payload,
@@ -147,6 +147,7 @@ engine.push_vcp_info = _push_runtime_vcp_info
 # FastAPI lifespan（替代 Express listen + shutdown）
 # =================================================================
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动时初始化引擎，关闭时优雅 shutdown。"""
@@ -178,6 +179,7 @@ app.add_middleware(
 # 请求体大小限制中间件（替代 express.json({ limit: '10mb' })）
 # =================================================================
 
+
 @app.middleware("http")
 async def limit_body_size(request: Request, call_next):
     content_length = request.headers.get("content-length")
@@ -192,6 +194,7 @@ async def limit_body_size(request: Request, call_next):
 # =================================================================
 # Routes
 # =================================================================
+
 
 @app.get("/status")
 async def status():
@@ -258,17 +261,17 @@ async def chat_events(request: Request):
     if not request_id:
         return JSONResponse(status_code=400, content={"error": {"message": "request_id is required"}})
 
-    if runtime_event_hub.is_finished(request_id):
-        return Response(status_code=204)
-
     async def _event_stream():
         queue = runtime_event_hub.subscribe(request_id)
         try:
-            for event in runtime_event_hub.snapshot(request_id):
+            backlog = runtime_event_hub.snapshot(request_id)
+            for event in backlog:
                 yield _build_sse_data(event)
 
             while True:
                 if runtime_event_hub.is_finished(request_id) and queue.empty():
+                    break
+                if await request.is_disconnected():
                     break
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=SSE_KEEPALIVE_SECONDS)
@@ -343,21 +346,19 @@ async def _chat_completions_impl(request: Request, force_show_vcp: bool):
         if isinstance(raw_content, str):
             user_message = raw_content
         elif isinstance(raw_content, list):
-            user_message = next(
-                (p.get("text", "") for p in raw_content if p.get("type") == "text"), ""
-            )
+            user_message = next((p.get("text", "") for p in raw_content if p.get("type") == "text"), "")
         else:
             user_message = ""
 
         user_message = _strip_system_notification(user_message)
 
-        conversation_history = [
-            m for m in messages[:last_user_idx] if m.get("role") != "system"
-        ]
+        conversation_history = [m for m in messages[:last_user_idx] if m.get("role") != "system"]
 
         system_messages = [m for m in messages if m.get("role") == "system" and isinstance(m.get("content"), str)]
         if system_messages:
-            _emit_runtime_event("PLACEHOLDER_PROCESS_START", {"system_message_count": len(system_messages)}, request_id=request_id)
+            _emit_runtime_event(
+                "PLACEHOLDER_PROCESS_START", {"system_message_count": len(system_messages)}, request_id=request_id
+            )
             preprocessed = []
             root_path = engine.config.get("root_path") or os.environ.get("KNOWLEDGEBASE_ROOT_PATH", "")
             for msg in messages:
@@ -371,7 +372,9 @@ async def _chat_completions_impl(request: Request, force_show_vcp: bool):
                 user_content=user_message,
                 ai_content=last_ai_before_user,
             )
-            _emit_runtime_event("PLACEHOLDER_PROCESS_DONE", {"system_message_count": len(system_messages)}, request_id=request_id)
+            _emit_runtime_event(
+                "PLACEHOLDER_PROCESS_DONE", {"system_message_count": len(system_messages)}, request_id=request_id
+            )
 
         # TagMemo 记忆检索
         logger.info('[App] Query: "%s..."', user_message[:80])
@@ -433,18 +436,20 @@ async def _chat_completions_impl(request: Request, force_show_vcp: bool):
         stream = body.get("stream", False)
 
         # 构建上游请求体（排除已处理的字段）
-        upstream_body = {
-            k: v for k, v in body.items() if k not in ("messages", "requestId", "request_id", "messageId")
-        }
+        upstream_body = {k: v for k, v in body.items() if k not in ("messages", "requestId", "request_id", "messageId")}
         upstream_body["messages"] = enhanced_messages
         upstream_body["model"] = model
         upstream_body["stream"] = stream
 
         if CHAT_API_URL:
             if stream:
-                return await _handle_stream_response(upstream_body, metrics, request_id=request_id, force_show_vcp=force_show_vcp)
+                return await _handle_stream_response(
+                    upstream_body, metrics, request_id=request_id, force_show_vcp=force_show_vcp
+                )
             else:
-                return await _handle_normal_response(upstream_body, metrics, request_id=request_id, force_show_vcp=force_show_vcp)
+                return await _handle_normal_response(
+                    upstream_body, metrics, request_id=request_id, force_show_vcp=force_show_vcp
+                )
         else:
             # 调试模式：无上游 API，直接返回记忆检索结果
             _finish_runtime_request(request_id, status="ok", detail={"mode": "debug-no-upstream"})
@@ -693,9 +698,7 @@ async def admin_overview():
 
 @app.get("/v1/admin/logs/recent")
 async def admin_logs_recent(limit: int = 200, endpoint: str | None = None, status: str | None = None):
-    return {
-        "items": audit_logger.query_recent(limit=max(1, min(limit, 1000)), endpoint=endpoint, status=status)
-    }
+    return {"items": audit_logger.query_recent(limit=max(1, min(limit, 1000)), endpoint=endpoint, status=status)}
 
 
 @app.get("/v1/admin/logs/files")
@@ -761,10 +764,7 @@ async def admin_db_table(
     ).fetchall()
     conn.close()
 
-    items = [
-        {col: _json_safe_sql_value(val) for col, val in zip(columns, row)}
-        for row in rows
-    ]
+    items = [{col: _json_safe_sql_value(val) for col, val in zip(columns, row)} for row in rows]
     return {
         "columns": columns,
         "rows": items,
@@ -926,6 +926,7 @@ def _audit_query_event(
 # Upstream Proxy
 # =================================================================
 
+
 async def _handle_normal_response(body: dict, tagmemo_metrics: dict, *, request_id: str, force_show_vcp: bool = False):
     """非流式转发：向上游 Chat API 发送请求并返回 JSON 响应。"""
     request_token = _CURRENT_REQUEST_ID.set(request_id)
@@ -948,8 +949,12 @@ async def _handle_normal_response(body: dict, tagmemo_metrics: dict, *, request_
                     )
                 except httpx.RequestError as exc:
                     logger.error("[App] Upstream request failed: %s", exc)
-                    _emit_runtime_event("ERROR", {"message": str(exc), "stage": "upstream_nonstream"}, request_id=request_id)
-                    _finish_runtime_request(request_id, status="error", detail={"message": str(exc), "stage": "upstream_nonstream"})
+                    _emit_runtime_event(
+                        "ERROR", {"message": str(exc), "stage": "upstream_nonstream"}, request_id=request_id
+                    )
+                    _finish_runtime_request(
+                        request_id, status="error", detail={"message": str(exc), "stage": "upstream_nonstream"}
+                    )
                     return JSONResponse(
                         status_code=502,
                         content={"error": {"message": f"Upstream connection error: {exc}"}},
@@ -958,8 +963,14 @@ async def _handle_normal_response(body: dict, tagmemo_metrics: dict, *, request_
             if resp.status_code != 200:
                 error_text = resp.text[:500]
                 logger.error("[App] Upstream error %d: %s", resp.status_code, error_text[:200])
-                _emit_runtime_event("ERROR", {"message": error_text, "status_code": resp.status_code, "stage": "upstream_nonstream"}, request_id=request_id)
-                _finish_runtime_request(request_id, status="error", detail={"status_code": resp.status_code, "stage": "upstream_nonstream"})
+                _emit_runtime_event(
+                    "ERROR",
+                    {"message": error_text, "status_code": resp.status_code, "stage": "upstream_nonstream"},
+                    request_id=request_id,
+                )
+                _finish_runtime_request(
+                    request_id, status="error", detail={"status_code": resp.status_code, "stage": "upstream_nonstream"}
+                )
                 return JSONResponse(
                     status_code=resp.status_code,
                     content={
@@ -971,11 +982,25 @@ async def _handle_normal_response(body: dict, tagmemo_metrics: dict, *, request_
                 )
 
             latest_data = resp.json()
+            if not isinstance(latest_data, dict):
+                _finish_runtime_request(
+                    request_id,
+                    status="error",
+                    detail={"message": "Upstream returned non-object JSON", "stage": "upstream_nonstream"},
+                )
+                return JSONResponse(
+                    status_code=502,
+                    content={"error": {"message": "Upstream returned non-object JSON"}},
+                )
             choices = latest_data.get("choices") or []
             assistant_content = ""
             if choices:
                 assistant_content = ((choices[0].get("message") or {}).get("content")) or ""
-            _emit_runtime_event("LLM_RESPONSE_DONE", {"depth": depth + 1, "content_length": len(assistant_content)}, request_id=request_id)
+            _emit_runtime_event(
+                "LLM_RESPONSE_DONE",
+                {"depth": depth + 1, "content_length": len(assistant_content)},
+                request_id=request_id,
+            )
 
             await _handle_diary_from_ai_response(assistant_content)
             vcp_history.append(assistant_content)
@@ -987,14 +1012,18 @@ async def _handle_normal_response(body: dict, tagmemo_metrics: dict, *, request_
             tool_outputs = []
             for tc in tool_calls:
                 output = await _execute_compatible_tool(tc["tool_name"], tc.get("params") or {}, request_id=request_id)
-                tool_outputs.append({
-                    "tool_name": tc["tool_name"],
-                    "status": "success" if not output.get("error") else "error",
-                    "content": output,
-                })
+                tool_outputs.append(
+                    {
+                        "tool_name": tc["tool_name"],
+                        "status": "success" if not output.get("error") else "error",
+                        "content": output,
+                    }
+                )
 
             if RAG_MEMO_REFRESH:
-                _emit_runtime_event("RAG_REFRESH_START", {"depth": depth + 1, "tool_count": len(tool_outputs)}, request_id=request_id)
+                _emit_runtime_event(
+                    "RAG_REFRESH_START", {"depth": depth + 1, "tool_count": len(tool_outputs)}, request_id=request_id
+                )
                 current_messages = await vcp_placeholder_processor.refresh_rag_blocks_if_needed(
                     current_messages,
                     new_context={
@@ -1002,7 +1031,9 @@ async def _handle_normal_response(body: dict, tagmemo_metrics: dict, *, request_
                         "toolResultsText": build_tool_payload_for_rag(tool_outputs),
                     },
                 )
-                _emit_runtime_event("RAG_REFRESH_DONE", {"depth": depth + 1, "tool_count": len(tool_outputs)}, request_id=request_id)
+                _emit_runtime_event(
+                    "RAG_REFRESH_DONE", {"depth": depth + 1, "tool_count": len(tool_outputs)}, request_id=request_id
+                )
 
             tool_payload_text = build_tool_payload_for_rag(tool_outputs)
             tool_payload = f"<!-- VCP_TOOL_PAYLOAD -->\n{tool_payload_text}"
@@ -1028,12 +1059,12 @@ async def _handle_normal_response(body: dict, tagmemo_metrics: dict, *, request_
 
 
 def _build_sse_data(payload: dict) -> bytes:
-    return f"data: {json.dumps(payload, ensure_ascii=False)}\\n\\n".encode("utf-8")
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
 
 def _build_sse_comment(comment: str) -> bytes:
     safe = (comment or "keepalive").replace("\n", " ").replace("\r", " ")
-    return f": {safe}\\n\\n".encode("utf-8")
+    return f": {safe}\n\n".encode("utf-8")
 
 
 def _build_sse_text_chunk(text: str, *, finish_reason=None) -> bytes:
@@ -1067,7 +1098,9 @@ async def _handle_stream_response(body: dict, tagmemo_metrics: dict, *, request_
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 for depth in range(MAX_VCP_LOOP_STREAM + 1):
-                    _emit_runtime_event("LLM_REQUEST_START", {"depth": depth + 1, "mode": "stream"}, request_id=request_id)
+                    _emit_runtime_event(
+                        "LLM_REQUEST_START", {"depth": depth + 1, "mode": "stream"}, request_id=request_id
+                    )
                     try:
                         req = client.build_request(
                             "POST",
@@ -1081,17 +1114,29 @@ async def _handle_stream_response(body: dict, tagmemo_metrics: dict, *, request_
                         resp = await client.send(req, stream=True)
                     except httpx.RequestError as exc:
                         logger.error("[App] Upstream stream request failed: %s", exc)
-                        _emit_runtime_event("ERROR", {"message": str(exc), "stage": "upstream_stream"}, request_id=request_id)
+                        _emit_runtime_event(
+                            "ERROR", {"message": str(exc), "stage": "upstream_stream"}, request_id=request_id
+                        )
                         payload = {"error": {"message": f"Upstream connection error: {exc}"}}
-                        _finish_runtime_request(request_id, status="error", detail={"message": str(exc), "stage": "upstream_stream"})
+                        _finish_runtime_request(
+                            request_id, status="error", detail={"message": str(exc), "stage": "upstream_stream"}
+                        )
                         yield _build_sse_data(payload)
                         break
 
                     if resp.status_code != 200:
                         error_text = (await resp.aread()).decode(errors="replace")[:500]
                         await resp.aclose()
-                        _emit_runtime_event("ERROR", {"message": error_text, "status_code": resp.status_code, "stage": "upstream_stream"}, request_id=request_id)
-                        _finish_runtime_request(request_id, status="error", detail={"status_code": resp.status_code, "stage": "upstream_stream"})
+                        _emit_runtime_event(
+                            "ERROR",
+                            {"message": error_text, "status_code": resp.status_code, "stage": "upstream_stream"},
+                            request_id=request_id,
+                        )
+                        _finish_runtime_request(
+                            request_id,
+                            status="error",
+                            detail={"status_code": resp.status_code, "stage": "upstream_stream"},
+                        )
                         payload = {
                             "error": {
                                 "message": f"Upstream API error: {resp.status_code}",
@@ -1130,8 +1175,8 @@ async def _handle_stream_response(body: dict, tagmemo_metrics: dict, *, request_
                                         continue
                                     try:
                                         obj = json.loads(payload_text)
-                                        delta = ((obj.get("choices") or [{}])[0].get("delta") or {})
-                                        msg = ((obj.get("choices") or [{}])[0].get("message") or {})
+                                        delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+                                        msg = (obj.get("choices") or [{}])[0].get("message") or {}
                                         content_piece = delta.get("content") or msg.get("content") or ""
                                         if content_piece:
                                             assistant_content_parts.append(content_piece)
@@ -1147,8 +1192,8 @@ async def _handle_stream_response(body: dict, tagmemo_metrics: dict, *, request_
                                 if payload_text and payload_text != "[DONE]":
                                     try:
                                         obj = json.loads(payload_text)
-                                        delta = ((obj.get("choices") or [{}])[0].get("delta") or {})
-                                        msg = ((obj.get("choices") or [{}])[0].get("message") or {})
+                                        delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+                                        msg = (obj.get("choices") or [{}])[0].get("message") or {}
                                         content_piece = delta.get("content") or msg.get("content") or ""
                                         if content_piece:
                                             assistant_content_parts.append(content_piece)
@@ -1160,7 +1205,11 @@ async def _handle_stream_response(body: dict, tagmemo_metrics: dict, *, request_
 
                     raw_text = "".join(raw_text_parts)
                     assistant_content = "".join(assistant_content_parts)
-                    _emit_runtime_event("LLM_RESPONSE_DONE", {"depth": depth + 1, "content_length": len(assistant_content)}, request_id=request_id)
+                    _emit_runtime_event(
+                        "LLM_RESPONSE_DONE",
+                        {"depth": depth + 1, "content_length": len(assistant_content)},
+                        request_id=request_id,
+                    )
                     try:
                         await _handle_diary_from_ai_response(raw_text)
                     except Exception as exc:
@@ -1176,21 +1225,29 @@ async def _handle_stream_response(body: dict, tagmemo_metrics: dict, *, request_
                         if force_show_vcp:
                             yield _build_sse_text_chunk(f"\n🔍 正在执行工具: {tc['tool_name']}\n")
 
-                        tool_task = asyncio.create_task(_execute_compatible_tool(tc["tool_name"], tc.get("params") or {}, request_id=request_id))
+                        tool_task = asyncio.create_task(
+                            _execute_compatible_tool(tc["tool_name"], tc.get("params") or {}, request_id=request_id)
+                        )
                         while not tool_task.done():
                             try:
                                 await asyncio.wait_for(asyncio.shield(tool_task), timeout=SSE_KEEPALIVE_SECONDS)
                             except asyncio.TimeoutError:
                                 yield _build_sse_comment("vcp-keepalive")
                         output = await tool_task
-                        tool_outputs.append({
-                            "tool_name": tc["tool_name"],
-                            "status": "success" if not output.get("error") else "error",
-                            "content": output,
-                        })
+                        tool_outputs.append(
+                            {
+                                "tool_name": tc["tool_name"],
+                                "status": "success" if not output.get("error") else "error",
+                                "content": output,
+                            }
+                        )
 
                     if RAG_MEMO_REFRESH:
-                        _emit_runtime_event("RAG_REFRESH_START", {"depth": depth + 1, "tool_count": len(tool_outputs)}, request_id=request_id)
+                        _emit_runtime_event(
+                            "RAG_REFRESH_START",
+                            {"depth": depth + 1, "tool_count": len(tool_outputs)},
+                            request_id=request_id,
+                        )
                         current_messages = await vcp_placeholder_processor.refresh_rag_blocks_if_needed(
                             current_messages,
                             new_context={
@@ -1198,7 +1255,11 @@ async def _handle_stream_response(body: dict, tagmemo_metrics: dict, *, request_
                                 "toolResultsText": build_tool_payload_for_rag(tool_outputs),
                             },
                         )
-                        _emit_runtime_event("RAG_REFRESH_DONE", {"depth": depth + 1, "tool_count": len(tool_outputs)}, request_id=request_id)
+                        _emit_runtime_event(
+                            "RAG_REFRESH_DONE",
+                            {"depth": depth + 1, "tool_count": len(tool_outputs)},
+                            request_id=request_id,
+                        )
 
                     tool_payload_text = build_tool_payload_for_rag(tool_outputs)
                     if force_show_vcp:
@@ -1225,32 +1286,28 @@ async def _handle_stream_response(body: dict, tagmemo_metrics: dict, *, request_
 # Message Builder
 # =================================================================
 
-def _build_enhanced_messages(
-    original_messages: list[dict], memory_context: str
-) -> list[dict]:
+
+def _build_enhanced_messages(original_messages: list[dict], memory_context: str) -> list[dict]:
     """将记忆上下文注入 system prompt。1:1 对应原 buildEnhancedMessages。"""
     enhanced = json.loads(json.dumps(original_messages))  # deep copy
 
     if not memory_context or memory_context == "没有找到相关的记忆片段。":
         return enhanced
 
-    memory_block = (
-        f"\n\n--- 以下是与当前对话相关的记忆信息 ---\n"
-        f"{memory_context}\n"
-        f"--- 记忆信息结束 ---"
-    )
+    memory_block = f"\n\n--- 以下是与当前对话相关的记忆信息 ---\n{memory_context}\n--- 记忆信息结束 ---"
 
-    system_idx = next(
-        (i for i, m in enumerate(enhanced) if m.get("role") == "system"), -1
-    )
+    system_idx = next((i for i, m in enumerate(enhanced) if m.get("role") == "system"), -1)
 
     if system_idx >= 0:
         enhanced[system_idx]["content"] += memory_block
     else:
-        enhanced.insert(0, {
-            "role": "system",
-            "content": SYSTEM_PROMPT_TEMPLATE + memory_block,
-        })
+        enhanced.insert(
+            0,
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT_TEMPLATE + memory_block,
+            },
+        )
 
     return enhanced
 
@@ -1258,6 +1315,7 @@ def _build_enhanced_messages(
 # =================================================================
 # Helpers
 # =================================================================
+
 
 def _find_last_index(arr: list, predicate) -> int:
     """Python 无内置 findLastIndex，手动实现。"""
@@ -1331,7 +1389,9 @@ async def _execute_compatible_tool(tool_name: str, params: dict[str, str], reque
                 },
             )
             output = {"status": "success", "result": result}
-            _emit_runtime_event("TOOL_RESULT", {"tool_name": tool_name, "status": "success", "result": output}, request_id=request_id)
+            _emit_runtime_event(
+                "TOOL_RESULT", {"tool_name": tool_name, "status": "success", "result": output}, request_id=request_id
+            )
             return output
 
         if name in {"tagmemomemorydelete", "memorydelete", "tagmemo_delete", "tagmemo.memory.delete"}:
@@ -1351,7 +1411,9 @@ async def _execute_compatible_tool(tool_name: str, params: dict[str, str], reque
                 cleanup_orphans=True,
             )
             output = {"status": "success", "result": result}
-            _emit_runtime_event("TOOL_RESULT", {"tool_name": tool_name, "status": "success", "result": output}, request_id=request_id)
+            _emit_runtime_event(
+                "TOOL_RESULT", {"tool_name": tool_name, "status": "success", "result": output}, request_id=request_id
+            )
             return output
 
         if name in {"dailynote", "tagmemo.dailynote"}:
@@ -1388,14 +1450,18 @@ async def _execute_compatible_tool(tool_name: str, params: dict[str, str], reque
                     logger.warning("[DailyNote] Queue ingestion failed: %s", exc)
 
             output = {"status": "success", "result": {"path": str(target), "command": command}}
-            _emit_runtime_event("TOOL_RESULT", {"tool_name": tool_name, "status": "success", "result": output}, request_id=request_id)
+            _emit_runtime_event(
+                "TOOL_RESULT", {"tool_name": tool_name, "status": "success", "result": output}, request_id=request_id
+            )
             return output
 
         output = {
             "error": "ToolNotSupported",
             "details": f"Unsupported tool_name: {tool_name}",
         }
-        _emit_runtime_event("TOOL_ERROR", {"tool_name": tool_name, "status": "error", "result": output}, request_id=request_id)
+        _emit_runtime_event(
+            "TOOL_ERROR", {"tool_name": tool_name, "status": "error", "result": output}, request_id=request_id
+        )
         return output
     except Exception as exc:
         output = {
@@ -1403,13 +1469,16 @@ async def _execute_compatible_tool(tool_name: str, params: dict[str, str], reque
             "details": str(exc),
             "trace": traceback.format_exc(limit=2),
         }
-        _emit_runtime_event("TOOL_ERROR", {"tool_name": tool_name, "status": "error", "result": output}, request_id=request_id)
+        _emit_runtime_event(
+            "TOOL_ERROR", {"tool_name": tool_name, "status": "error", "result": output}, request_id=request_id
+        )
         return output
 
 
 # =================================================================
 # CLI Mode
 # =================================================================
+
 
 async def run_cli() -> None:
     """交互式命令行模式，替代原 runCLI()。"""
@@ -1441,18 +1510,17 @@ async def run_cli() -> None:
             continue
 
         if user_input == "/status":
-            print(json.dumps(
-                {
-                    "engine": engine.initialized,
-                    "embedding": (
-                        engine.embedding_service.get_stats()
-                        if engine.embedding_service else None
-                    ),
-                    "history_length": len(history),
-                },
-                indent=2,
-                ensure_ascii=False,
-            ))
+            print(
+                json.dumps(
+                    {
+                        "engine": engine.initialized,
+                        "embedding": (engine.embedding_service.get_stats() if engine.embedding_service else None),
+                        "history_length": len(history),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
             continue
 
         try:
@@ -1492,11 +1560,7 @@ async def run_cli() -> None:
 
                 if resp.status_code == 200:
                     data = resp.json()
-                    reply = (
-                        data.get("choices", [{}])[0]
-                        .get("message", {})
-                        .get("content", "(empty response)")
-                    )
+                    reply = data.get("choices", [{}])[0].get("message", {}).get("content", "(empty response)")
                     print(f"\nAI: {reply}")
                     history.append({"role": "user", "content": user_input})
                     history.append({"role": "assistant", "content": reply})
@@ -1515,6 +1579,7 @@ async def run_cli() -> None:
 # =================================================================
 # Entry Point
 # =================================================================
+
 
 def _configure_app_logging() -> None:
     root = logging.getLogger()

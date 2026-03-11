@@ -3,7 +3,6 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 import app as tagmemo_app
-
 from tagmemo.runtime_events import RuntimeEventHub
 
 
@@ -33,15 +32,29 @@ def test_runtime_event_hub_end_request_and_prune() -> None:
     assert hub.snapshot("req-2") == []
 
 
-def test_chat_events_returns_204_for_finished_request(monkeypatch) -> None:
+def test_chat_events_replays_sse_for_finished_request(monkeypatch) -> None:
     hub = RuntimeEventHub(max_events_per_request=10, retention_seconds=60)
     hub.start_request("req-finished")
-    hub.publish("req-finished", "REQUEST_START", {"message": "hello"})
-    hub.end_request("req-finished", {"status": "ok"})
+    first = hub.publish("req-finished", "REQUEST_START", {"message": "hello"})
+    end_event = hub.end_request("req-finished", {"status": "ok"})
     monkeypatch.setattr(tagmemo_app, "runtime_event_hub", hub)
 
     client = TestClient(tagmemo_app.app)
-    response = client.get("/v1/chat/events", params={"request_id": "req-finished"})
+    with client.stream("GET", "/v1/chat/events", params={"request_id": "req-finished"}) as response:
+        body = b"".join(response.iter_bytes())
 
-    assert response.status_code == 204
-    assert response.text == ""
+    text = body.decode("utf-8")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert f"data: {tagmemo_app.json.dumps(first, ensure_ascii=False)}\n\n" in text
+    assert f"data: {tagmemo_app.json.dumps(end_event, ensure_ascii=False)}\n\n" in text
+
+
+def test_build_sse_helpers_use_real_newlines() -> None:
+    data = tagmemo_app._build_sse_data({"event_type": "REQUEST_START"}).decode("utf-8")
+    comment = tagmemo_app._build_sse_comment("keepalive").decode("utf-8")
+
+    assert data.endswith("\n\n")
+    assert "\\n\\n" not in data
+    assert comment == ": keepalive\n\n"
